@@ -1,0 +1,54 @@
+[project]
+name = "face-sniper-ssl"
+version = "0.1.0"
+description = "One-day label-free face encoder (MoCo + MarginNCE)"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "torchvision",
+  "pyarrow",
+  "polars",
+  "numpy",
+  "pyyaml",
+  "tqdm",
+  "faiss-cpu",
+  "pillow",
+  "wandb",
+  "hydra-core",
+  "omegaconf",
+]
+
+[dependency-groups]
+dev = [
+  "ruff",
+  "mypy",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+  "E",      # pycodestyle errors
+  "W",      # pycodestyle warnings
+  "F",      # pyflakes
+  "I",      # isort
+  "B",      # flake8-bugbear
+  "UP",     # pyupgrade
+  "RUF",    # ruff-specific
+]
+ignore = [
+  "E501",   # line too long (handled by formatter)
+  "B008",   # function call in default argument (common in dataclasses)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["moco", "dataio", "sniperface"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
