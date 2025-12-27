@@ -51,8 +51,8 @@ wandb:
 # The split is identity-disjoint: same person never appears in both sets.
 
 data:
-  digiface_glob: "data/digiface/**/*.parquet"
-  digi2real_glob: "data/digi2real/**/*.parquet"
+  digiface_glob: "data/digiface1m_*.parquet"
+  digi2real_glob: "data/digi2real_*.parquet"
 
   split:
     train_ratio: 0.75
@@ -101,7 +101,7 @@ train:
     tf32_matmul: true
 
   batch:
-    per_gpu: 128
+    size: 128
     grad_accum_steps: 2
 
   optimizer:

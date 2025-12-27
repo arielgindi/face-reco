@@ -447,7 +447,7 @@ def cmd_train(cfg: DictConfig) -> None:
         wandb.watch(model, log="gradients", log_freq=log_every * 10)
 
     # Training config
-    batch_size = int(cfg.train.batch.per_gpu)
+    batch_size = int(cfg.train.batch.size)
     grad_accum = int(cfg.train.batch.grad_accum_steps)
     epochs = int(cfg.train.epochs)
 
