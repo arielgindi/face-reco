@@ -1,8 +1,10 @@
-# face_sniper_ssl
+# SniperFace
 
 Minimal (3-file) codebase to train a **label-free** face embedding model using
 **MoCo + MarginNCE**, then export embeddings and evaluate retrieval accuracy on
 **unseen identities**.
+
+Uses **Hydra** for configuration and **Weights & Biases** for experiment tracking.
 
 ## Install / Run (uv-first)
 
@@ -10,69 +12,60 @@ Minimal (3-file) codebase to train a **label-free** face embedding model using
 uv sync
 ```
 
-All commands are run as:
+All commands are run via Hydra config overrides:
 
 ```bash
-uv run python sniperface.py <command> ...
+uv run python sniperface.py                    # Train with defaults
+uv run python sniperface.py train.epochs=100   # Override any config value
+uv run python sniperface.py wandb.enabled=false # Disable W&B
 ```
 
-## 1) Split (identity-disjoint)
+## 1) Train (MoCo + MarginNCE)
+
+Training **automatically** creates identity-disjoint splits (75% train / 25% test)
+and excludes test identities. No manual split step needed.
 
 ```bash
-uv run python sniperface.py split \
-  --digiface-glob "data/digiface1m_*.parquet" \
-  --digi2real-glob "data/digi2real_*.parquet" \
-  --out-dir "data/splits" \
-  --train-ratio 0.75 \
-  --seed 42 \
-  --materialize
+uv run python sniperface.py
 ```
 
-Outputs:
-
-- `data/splits/identity_splits.parquet`
-- `data/splits/train/{digiface,digi2real}/*.parquet`
-- `data/splits/test/{digiface,digi2real}/*.parquet`
-
-## 2) Train (MoCo + MarginNCE)
+Override settings from CLI:
 
 ```bash
-uv run python sniperface.py train \
-  --config config.yaml \
-  --train-digiface-glob "data/splits/train/digiface/*.parquet" \
-  --train-digi2real-glob "data/splits/train/digi2real/*.parquet" \
-  --out "runs/run_001" \
-  --num-workers 4
+uv run python sniperface.py train.epochs=30 train.batch.size=64
 ```
 
-Outputs:
+Outputs (in Hydra output dir):
 
-- `runs/run_001/checkpoints/epoch_XXX.pt`
-- `runs/run_001/train_log.jsonl`
+- `checkpoints/epoch_XXX.pt`
+- `identity_splits.parquet`
 
-## 3) Embed (export embeddings)
+## 2) Embed (export embeddings)
 
 ```bash
-uv run python sniperface.py embed \
-  --checkpoint "runs/run_001/checkpoints/epoch_050.pt" \
-  --test-glob "data/splits/test/*/*.parquet" \
-  --out "embeddings/test_embeddings.parquet" \
-  --batch-size 256
+uv run python sniperface.py command=embed
 ```
 
-## 4) Evaluate (Rank-1 / Top-K)
+By default, exports embeddings for **test identities only** (the 25% held out).
+
+## 3) Evaluate (Rank-1 / Top-K)
 
 ```bash
-uv run python sniperface.py eval \
-  --embeddings "embeddings/test_embeddings.parquet" \
-  --enroll-per-id 5 \
-  --seed 42 \
-  --top-k 5 \
-  --out "runs/run_001/metrics.json"
+uv run python sniperface.py command=eval
 ```
+
+## Configuration
+
+All settings are in `conf/config.yaml`. Key sections:
+
+- `data` - Parquet file globs and split settings
+- `train` - Epochs, batch size, optimizer, LR schedule
+- `wandb` - W&B project, tags, logging frequency
+- `augmentation` - Two-view augmentations for contrastive learning
 
 ## Notes
 
 - The training step only consumes `(view_q, view_k)` tensors. Identity is never
   passed into the SSL loss.
-- `config.yaml` controls model/training/augmentation hyperparameters.
+- Test identities (25%) are **automatically protected** during training.
+- `conf/config.yaml` controls model/training/augmentation hyperparameters.

@@ -9,8 +9,9 @@ Minimal codebase with 3 Python files, runnable via `uv`.
 ```
 face_sniper_ssl/
   pyproject.toml
-  config.yaml                  # training hyperparams (the one we wrote)
-  sniperface.py                # single CLI entrypoint (split/train/embed/eval)
+  conf/
+    config.yaml                # Hydra config (training hyperparams)
+  sniperface.py                # single CLI entrypoint (train/embed/eval via Hydra)
   moco.py                      # model + loss + queue + momentum encoder
   dataio.py                    # parquet streaming + split/materialize helpers
   README.md                    # short run instructions
@@ -210,12 +211,12 @@ Everything needed to compute:
 
 ---
 
-### `sniperface.py` (the only “script”)
+### `sniperface.py` (the only "script")
 
 Responsibilities:
 
-* CLI parsing (argparse)
-* Load YAML config
+* CLI via Hydra (config overrides from command line)
+* Load config from `conf/config.yaml`
 * Wire together data stream + model + optimizer + AMP scaler
 * Run the loop for `train`
 * Run `embed` and `eval`
@@ -225,32 +226,30 @@ This file stays small because the heavy logic lives in `dataio.py` and `moco.py`
 
 ---
 
-## 5) Run order (the exact sequence you’ll execute)
+## 5) Run order (the exact sequence you'll execute)
 
-1. **Split + materialize**
+All commands use Hydra config overrides. Training **automatically** creates identity-disjoint splits and excludes test identities (25%).
 
-* `uv run python sniperface.py split ...`
+1. **Train** (auto-creates splits, excludes 25% test identities)
 
-2. **Train**
+* `uv run python sniperface.py`
+* `uv run python sniperface.py train.epochs=100`
 
-* `uv run python sniperface.py train --config config.yaml ...`
+2. **Embed**
 
-3. **Embed**
+* `uv run python sniperface.py command=embed`
 
-* `uv run python sniperface.py embed ...`
+3. **Evaluate**
 
-4. **Evaluate**
-
-* `uv run python sniperface.py eval ...`
+* `uv run python sniperface.py command=eval`
 
 ---
 
-## 6) One design decision you should pick now (so the code stays simple)
+## 6) Identity filtering (automatic)
 
-**Do you want to “materialize” train/test Parquet shards (recommended)?**
+Training **automatically** filters identities during streaming:
 
-* Yes → training is simple + fast (no per-row membership checks)
-* No → training dataset must filter by `identity_id` on the fly, which adds overhead and complexity
+* 75% identities → training (automatically excluded from test)
+* 25% identities → test (automatically excluded from training)
 
-Recommendation: **materialize** for best performance.
-8
+No manual materialization needed. The `dataio.py` `allowed_identities` parameter filters during Parquet streaming.
