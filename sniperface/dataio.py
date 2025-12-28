@@ -236,7 +236,7 @@ class StreamParams:
     shuffle_files: bool = True
     batch_read_rows: int = 2048
     shuffle_within_batch: bool = True
-    shuffle_buffer_size: int = 10000
+    shuffle_buffer_size: int = 2048  # Reduced from 10K to prevent memory bloat
     seed: int = 42
 
 
@@ -512,8 +512,9 @@ class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tens
     This yields a *finite* number of samples (`num_samples`) and then stops.
     That allows using a DataLoader iterator per epoch without manual breaks.
 
-    Sampling is at the *sample* level (not file level), so batches may contain
-    a mixture of sources. This is acceptable for MoCo training.
+    Uses chunk-level mixing (not sample-level) to preserve I/O locality.
+    Reads `chunk_size` consecutive samples from one dataset before switching.
+    This prevents Parquet row group thrashing and cache invalidation.
     """
 
     def __init__(
@@ -524,18 +525,22 @@ class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tens
         p_digiface: float,
         num_samples: int,
         seed: int,
+        chunk_size: int = 2048,  # Aligned with batch_read_rows for optimal I/O
     ) -> None:
         super().__init__()
         if not 0.0 <= p_digiface <= 1.0:
             raise ValueError("p_digiface must be in [0, 1].")
         if num_samples <= 0:
             raise ValueError("num_samples must be positive.")
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive.")
 
         self.digiface = digiface
         self.digi2real = digi2real
         self.p_digiface = float(p_digiface)
         self.num_samples = int(num_samples)
         self.seed = int(seed)
+        self.chunk_size = int(chunk_size)
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         info = get_worker_info()
@@ -553,18 +558,56 @@ class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tens
         it_b = iter(self.digi2real) if self.digi2real is not None else None
 
         produced = 0
-        while produced < samples_per_worker:
-            pick_a = rng.random() < self.p_digiface or it_b is None
-            try:
-                if pick_a:
-                    sample = next(it_a)
-                else:
-                    sample = next(it_b)  # type: ignore[arg-type]
-            except StopIteration:
-                # Underlying streams are expected to be infinite, but recover if not.
-                it_a = iter(self.digiface)
-                it_b = iter(self.digi2real) if self.digi2real is not None else None
-                continue
+        # Track cumulative counts for ratio-aware chunk scheduling
+        count_a = 0
+        count_b = 0
 
-            produced += 1
-            yield sample
+        while produced < samples_per_worker:
+            # Determine chunk size (may be smaller at end of epoch)
+            remaining = samples_per_worker - produced
+            current_chunk_size = min(self.chunk_size, remaining)
+
+            # Ratio-aware dataset selection:
+            # Pick the dataset that is furthest behind its target ratio
+            if it_b is None:
+                pick_a = True
+            elif self.p_digiface >= 1.0:
+                pick_a = True
+            elif self.p_digiface <= 0.0:
+                pick_a = False
+            else:
+                total = count_a + count_b
+                if total == 0:
+                    # First chunk: use probability
+                    pick_a = rng.random() < self.p_digiface
+                else:
+                    # Pick dataset that's behind target ratio
+                    current_ratio_a = count_a / total
+                    pick_a = current_ratio_a < self.p_digiface
+
+            # Read a full chunk from the selected dataset
+            chunk_produced = 0
+            current_iter = it_a if pick_a else it_b
+
+            while chunk_produced < current_chunk_size and produced < samples_per_worker:
+                try:
+                    sample = next(current_iter)  # type: ignore[arg-type]
+                except StopIteration:
+                    # Underlying streams are expected to be infinite, but recover if not
+                    if pick_a:
+                        it_a = iter(self.digiface)
+                        current_iter = it_a
+                    else:
+                        it_b = iter(self.digi2real) if self.digi2real is not None else None
+                        current_iter = it_b
+                    continue
+
+                yield sample
+                produced += 1
+                chunk_produced += 1
+
+            # Update counters for ratio tracking
+            if pick_a:
+                count_a += chunk_produced
+            else:
+                count_b += chunk_produced
