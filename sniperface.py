@@ -886,6 +886,10 @@ def cmd_train(cfg: DictConfig) -> None:
                 artifact.add_file(str(ckpt_path))
                 wandb.log_artifact(artifact)
 
+        # Clear GPU memory between epochs to prevent fragmentation
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+
     logger.info("Training complete!")
     finish_wandb()
 
