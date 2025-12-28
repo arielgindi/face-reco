@@ -94,6 +94,7 @@ ssl:
 train:
   epochs: 50
   samples_per_epoch: 0  # 0 = auto (use dataset size)
+  resume: null  # Path to checkpoint to resume from (e.g., "checkpoints/epoch_015.pt")
 
   precision:
     amp: true
@@ -124,8 +125,8 @@ train:
     grad_clip_norm: 5.0
 
   checkpointing:
-    save_every_epochs: 5
-    keep_last: 3
+    save_every_epochs: 1  # Save every epoch for crash recovery
+    keep_last: 0  # 0 = keep all checkpoints
 
 # =============================================================================
 # Curriculum Learning Schedule

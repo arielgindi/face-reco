@@ -287,6 +287,43 @@ def build_embed_transform(input_size: tuple[int, int]) -> T.Compose:
 # =============================================================================
 
 
+def load_checkpoint_for_resume(
+    resume_path: str | Path,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scaler: torch.cuda.amp.GradScaler | None,
+    device: torch.device,
+) -> int:
+    """Load checkpoint and return the epoch to resume from.
+
+    Returns the next epoch to train (checkpoint_epoch, since we save after epoch completion).
+    """
+    path = Path(resume_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Resume checkpoint not found: {path}")
+
+    logger.info(f"Resuming from checkpoint: {path}")
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+
+    # Load model state
+    model.load_state_dict(ckpt["model"])
+    logger.info("Loaded model state")
+
+    # Load optimizer state
+    optimizer.load_state_dict(ckpt["optimizer"])
+    logger.info("Loaded optimizer state")
+
+    # Load scaler state if available
+    if scaler is not None and "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+        logger.info("Loaded AMP scaler state")
+
+    start_epoch = int(ckpt["epoch"])
+    logger.info(f"Resuming from epoch {start_epoch}")
+
+    return start_epoch
+
+
 def save_checkpoint(
     out_dir: Path,
     *,
@@ -324,6 +361,67 @@ def prune_checkpoints(ckpt_dir: Path, keep_last: int) -> None:
     for fp in ckpts[:-keep_last]:
         fp.unlink(missing_ok=True)
         logger.debug(f"Pruned checkpoint: {fp}")
+
+
+def prewarm_datasets(
+    digiface_ds: dataio.ParquetTwoViewDataset,
+    digi2real_ds: dataio.ParquetTwoViewDataset | None,
+    num_workers: int,
+    device: torch.device,
+) -> None:
+    """Pre-warm both datasets by iterating one sample from each.
+
+    This initializes file handles and DataLoader workers for both datasets
+    BEFORE the curriculum switch at epoch 16, preventing Windows deadlocks.
+    """
+    if num_workers <= 0:
+        logger.info("Skipping dataset pre-warm (num_workers=0)")
+        return
+
+    logger.info("Pre-warming datasets to initialize workers...")
+
+    # Pre-warm digiface
+    warm_ds = dataio.CurriculumMixTwoViewDataset(
+        digiface=digiface_ds,
+        digi2real=None,
+        p_digiface=1.0,
+        num_samples=num_workers * 2,  # Enough to engage all workers
+        seed=0,
+    )
+    warm_loader = DataLoader(
+        warm_ds,
+        batch_size=1,
+        num_workers=num_workers,
+        pin_memory=(device.type == "cuda"),
+        persistent_workers=False,  # Don't persist for warmup
+    )
+    for batch in warm_loader:
+        break  # Just need one batch to initialize
+    del warm_loader, warm_ds
+    logger.info("  DigiFace dataset warmed")
+
+    # Pre-warm digi2real if available
+    if digi2real_ds is not None:
+        warm_ds = dataio.CurriculumMixTwoViewDataset(
+            digiface=digiface_ds,
+            digi2real=digi2real_ds,
+            p_digiface=0.0,  # Force digi2real
+            num_samples=num_workers * 2,
+            seed=0,
+        )
+        warm_loader = DataLoader(
+            warm_ds,
+            batch_size=1,
+            num_workers=num_workers,
+            pin_memory=(device.type == "cuda"),
+            persistent_workers=False,
+        )
+        for batch in warm_loader:
+            break
+        del warm_loader, warm_ds
+        logger.info("  Digi2Real dataset warmed")
+
+    logger.info("Dataset pre-warming complete")
 
 
 # =============================================================================
@@ -464,6 +562,18 @@ def cmd_train(cfg: DictConfig) -> None:
     if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16:
         scaler = torch.cuda.amp.GradScaler()
 
+    # Handle resume from checkpoint
+    resume_path = cfg.train.get("resume")
+    start_epoch = 0
+    if resume_path:
+        start_epoch = load_checkpoint_for_resume(
+            resume_path=resume_path,
+            model=model,
+            optimizer=optimizer,
+            scaler=scaler,
+            device=device,
+        )
+
     # Transforms
     input_size = tuple(cfg.model.backbone.input_size)
     aug_cfg = cfg.augmentation
@@ -538,15 +648,23 @@ def cmd_train(cfg: DictConfig) -> None:
     keep_last = int(cfg.train.checkpointing.keep_last)
     num_workers = int(streaming_cfg.get("num_workers", 4))
 
+    # Pre-warm datasets to prevent Windows multiprocessing deadlock
+    # This initializes file handles for both datasets before training starts
+    prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
+
     # Curriculum schedule
     schedule = build_curriculum_schedule(cfg)
 
-    global_step = 0
+    # Calculate global_step for resume (approximate based on batches per epoch)
+    steps_per_epoch = num_batches // grad_accum
+    global_step = start_epoch * steps_per_epoch
     optimizer.zero_grad(set_to_none=True)
 
-    logger.info(f"Starting training for {epochs} epochs")
+    if start_epoch > 0:
+        logger.info(f"Resuming training from epoch {start_epoch} (global_step={global_step})")
+    logger.info(f"Training for epochs {start_epoch} to {epochs - 1}")
 
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         lr = lr_for_epoch(epoch)
         for pg in optimizer.param_groups:
             pg["lr"] = lr
@@ -561,13 +679,20 @@ def cmd_train(cfg: DictConfig) -> None:
             seed=seed + epoch * 17,
         )
 
-        loader = DataLoader(
-            epoch_ds,
-            batch_size=batch_size,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
-            drop_last=True,
-        )
+        # Windows-safe DataLoader settings:
+        # - persistent_workers: keeps workers alive between epochs (prevents respawn deadlock)
+        # - prefetch_factor: buffers batches for smoother data flow
+        loader_kwargs: dict[str, Any] = {
+            "batch_size": batch_size,
+            "num_workers": num_workers,
+            "pin_memory": device.type == "cuda",
+            "drop_last": True,
+        }
+        if num_workers > 0:
+            loader_kwargs["persistent_workers"] = True
+            loader_kwargs["prefetch_factor"] = 2
+
+        loader = DataLoader(epoch_ds, **loader_kwargs)
 
         epoch_loss_sum = 0.0
         epoch_pos_sum = 0.0
