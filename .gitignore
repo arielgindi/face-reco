@@ -90,3 +90,5 @@ Thumbs.db
 .env
 *.key
 credentials.json
+data.zip
+*.zip
