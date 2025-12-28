@@ -102,12 +102,12 @@ train:
     tf32_matmul: true
 
   batch:
-    size: 256  # Doubled for better GPU utilization (with channels_last)
-    grad_accum_steps: 1  # Halved to keep effective batch at 256 (no LR change needed)
+    size: 192  # Tested: 7.72 GB (64% VRAM) - stable
+    grad_accum_steps: 2  # Effective batch = 384
 
   optimizer:
     name: "sgd"
-    lr: 0.05
+    lr: 0.075  # Scaled: effective batch 256→384 (1.5x), so LR 0.05→0.075
     momentum: 0.9
     weight_decay: 5.0e-4
     nesterov: true
@@ -117,7 +117,7 @@ train:
     warmup:
       enabled: true
       epochs: 2
-      start_lr: 0.005
+      start_lr: 0.0075  # Scaled with base LR (1.5x)
     milestones: [10, 20, 30, 40]
     gamma: 0.1
 
