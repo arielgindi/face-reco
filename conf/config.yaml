@@ -102,8 +102,8 @@ train:
     tf32_matmul: true
 
   batch:
-    size: 128
-    grad_accum_steps: 2
+    size: 256  # Doubled for better GPU utilization (with channels_last)
+    grad_accum_steps: 1  # Halved to keep effective batch at 256 (no LR change needed)
 
   optimizer:
     name: "sgd"

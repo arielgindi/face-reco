@@ -291,7 +291,7 @@ def load_checkpoint_for_resume(
     resume_path: str | Path,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     device: torch.device,
 ) -> int:
     """Load checkpoint and return the epoch to resume from.
@@ -330,7 +330,7 @@ def save_checkpoint(
     epoch: int,
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scaler: torch.cuda.amp.GradScaler | None,
+    scaler: torch.amp.GradScaler | None,
     cfg: DictConfig,
 ) -> Path:
     """Save a training checkpoint."""
@@ -535,8 +535,18 @@ def cmd_train(cfg: DictConfig) -> None:
     # Save splits to output
     shutil.copy2(splits_path, out_dir / "identity_splits.parquet")
 
-    # Build model
+    # Build model with performance optimizations
     model = moco.build_moco(cfg, device=device)
+
+    # Channels-last memory format for better Tensor Core utilization on RTX 4070 Ti
+    model = model.to(memory_format=torch.channels_last)
+    logger.info("Applied channels_last memory format")
+
+    # torch.compile for JIT optimization (15-30% speedup after first epoch)
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+        logger.info("Applied torch.compile with reduce-overhead mode")
+
     model.train()
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
@@ -558,9 +568,9 @@ def cmd_train(cfg: DictConfig) -> None:
         nesterov=bool(optim_cfg.nesterov),
     )
 
-    scaler: torch.cuda.amp.GradScaler | None = None
+    scaler: torch.amp.GradScaler | None = None
     if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16:
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler("cuda")
 
     # Handle resume from checkpoint
     resume_path = cfg.train.get("resume")
@@ -702,10 +712,11 @@ def cmd_train(cfg: DictConfig) -> None:
 
         pbar = tqdm(loader, total=num_batches, desc=f"epoch {epoch:03d}", unit="batch")
         for step, (im_q, im_k) in enumerate(pbar):
-            im_q = im_q.to(device, non_blocking=True)
-            im_k = im_k.to(device, non_blocking=True)
+            # Move to device and convert to channels_last for Tensor Core optimization
+            im_q = im_q.to(device, non_blocking=True, memory_format=torch.channels_last)
+            im_k = im_k.to(device, non_blocking=True, memory_format=torch.channels_last)
 
-            with torch.cuda.amp.autocast(
+            with torch.amp.autocast("cuda",
                 enabled=amp_enabled and device.type == "cuda",
                 dtype=amp_dtype,
             ):
@@ -914,7 +925,7 @@ def cmd_embed(cfg: DictConfig) -> None:
     with torch.no_grad():
         for ids, fns, imgs in tqdm(loader, desc="embed", unit="batch"):
             imgs = imgs.to(device, non_blocking=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled, dtype=torch.float16):
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=torch.float16):
                 emb = backbone(imgs)
                 if l2_norm:
                     emb = moco.l2_normalize(emb, dim=1)
