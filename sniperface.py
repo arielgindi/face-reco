@@ -542,17 +542,9 @@ def cmd_train(cfg: DictConfig) -> None:
     model = model.to(memory_format=torch.channels_last)
     logger.info("Applied channels_last memory format")
 
-    # torch.compile for JIT optimization (15-30% speedup after first epoch)
-    if device.type == "cuda":
-        model = torch.compile(model, mode="reduce-overhead")
-        logger.info("Applied torch.compile with reduce-overhead mode")
-
     model.train()
     num_params = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {num_params:,}")
-
-    if wandb_active:
-        wandb.watch(model, log="gradients", log_freq=log_every * 10)
 
     # Training config
     batch_size = int(cfg.train.batch.size)
@@ -572,7 +564,7 @@ def cmd_train(cfg: DictConfig) -> None:
     if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16:
         scaler = torch.amp.GradScaler("cuda")
 
-    # Handle resume from checkpoint
+    # Handle resume from checkpoint (BEFORE torch.compile)
     resume_path = cfg.train.get("resume")
     start_epoch = 0
     if resume_path:
@@ -583,6 +575,15 @@ def cmd_train(cfg: DictConfig) -> None:
             scaler=scaler,
             device=device,
         )
+
+    # torch.compile for JIT optimization (15-30% speedup after first epoch)
+    # Must be AFTER loading checkpoint since compiled models have different state structure
+    if device.type == "cuda":
+        model = torch.compile(model, mode="reduce-overhead")
+        logger.info("Applied torch.compile with reduce-overhead mode")
+
+    if wandb_active:
+        wandb.watch(model, log="gradients", log_freq=log_every * 10)
 
     # Transforms
     input_size = tuple(cfg.model.backbone.input_size)
