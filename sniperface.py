@@ -701,8 +701,9 @@ def cmd_train(cfg: DictConfig) -> None:
     num_workers = int(streaming_cfg.get("num_workers", 4))
 
     # Pre-warm datasets to prevent Windows multiprocessing deadlock
-    # This initializes file handles for both datasets before training starts
-    prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
+    # Skip on Linux - not needed and adds ~90s overhead
+    if sys.platform == "win32":
+        prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
 
     # Curriculum schedule
     schedule = build_curriculum_schedule(cfg)
