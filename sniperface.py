@@ -32,15 +32,14 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn as nn
 import torchvision.transforms as T
-import wandb
 from omegaconf import DictConfig, OmegaConf
 from PIL import Image
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-import dataio
-import moco
+import wandb
+from sniperface import dataio, moco
 
 logger = logging.getLogger(__name__)
 
@@ -395,7 +394,7 @@ def prewarm_datasets(
         pin_memory=(device.type == "cuda"),
         persistent_workers=False,  # Don't persist for warmup
     )
-    for batch in warm_loader:
+    for _batch in warm_loader:
         break  # Just need one batch to initialize
     del warm_loader, warm_ds
     logger.info("  DigiFace dataset warmed")
@@ -416,7 +415,7 @@ def prewarm_datasets(
             pin_memory=(device.type == "cuda"),
             persistent_workers=False,
         )
-        for batch in warm_loader:
+        for _batch in warm_loader:
             break
         del warm_loader, warm_ds
         logger.info("  Digi2Real dataset warmed")
@@ -429,6 +428,45 @@ def prewarm_datasets(
 # =============================================================================
 
 
+def get_system_info() -> dict[str, Any]:
+    """Collect system information for W&B logging."""
+    info: dict[str, Any] = {
+        "pytorch_version": torch.__version__,
+        "cuda_available": torch.cuda.is_available(),
+    }
+
+    if torch.cuda.is_available():
+        info.update(
+            {
+                "gpu_name": torch.cuda.get_device_name(0),
+                "gpu_count": torch.cuda.device_count(),
+                "cuda_version": torch.version.cuda,
+                "cudnn_version": torch.backends.cudnn.version(),
+                "gpu_memory_total_gb": round(
+                    torch.cuda.get_device_properties(0).total_memory / 1024**3, 2
+                ),
+            }
+        )
+
+    return info
+
+
+def log_gpu_memory() -> dict[str, float]:
+    """Get current GPU memory usage for logging."""
+    if not torch.cuda.is_available():
+        return {}
+
+    return {
+        "gpu/memory_allocated_gb": round(
+            torch.cuda.memory_allocated() / 1024**3, 3
+        ),
+        "gpu/memory_reserved_gb": round(torch.cuda.memory_reserved() / 1024**3, 3),
+        "gpu/max_memory_allocated_gb": round(
+            torch.cuda.max_memory_allocated() / 1024**3, 3
+        ),
+    }
+
+
 def init_wandb(cfg: DictConfig, out_dir: Path) -> bool:
     """Initialize Weights & Biases if enabled. Returns True if W&B is active."""
     wandb_cfg = cfg.get("wandb", {})
@@ -438,6 +476,10 @@ def init_wandb(cfg: DictConfig, out_dir: Path) -> bool:
 
     # Convert config to dict for W&B
     config_dict = OmegaConf.to_container(cfg, resolve=True)
+
+    # Add system info to config
+    system_info = get_system_info()
+    config_dict["system"] = system_info
 
     wandb.init(
         project=wandb_cfg.get("project", "sniperface"),
@@ -449,6 +491,10 @@ def init_wandb(cfg: DictConfig, out_dir: Path) -> bool:
         dir=str(out_dir),
         resume="allow",
     )
+
+    # Log system info as summary
+    for key, value in system_info.items():
+        wandb.run.summary[f"system/{key}"] = value
 
     logger.info(f"W&B initialized: {wandb.run.url}")
     return True
@@ -578,9 +624,12 @@ def cmd_train(cfg: DictConfig) -> None:
 
     # torch.compile for JIT optimization (15-30% speedup after first epoch)
     # Must be AFTER loading checkpoint since compiled models have different state structure
-    if device.type == "cuda":
+    # NOTE: Requires Triton which is Linux-only; skipped on Windows
+    if device.type == "cuda" and sys.platform != "win32":
         model = torch.compile(model, mode="reduce-overhead")
         logger.info("Applied torch.compile with reduce-overhead mode")
+    elif device.type == "cuda":
+        logger.info("Skipping torch.compile (Triton not available on Windows)")
 
     if wandb_active:
         wandb.watch(model, log="gradients", log_freq=log_every * 10)
@@ -717,7 +766,8 @@ def cmd_train(cfg: DictConfig) -> None:
             im_q = im_q.to(device, non_blocking=True, memory_format=torch.channels_last)
             im_k = im_k.to(device, non_blocking=True, memory_format=torch.channels_last)
 
-            with torch.amp.autocast("cuda",
+            with torch.amp.autocast(
+                "cuda",
                 enabled=amp_enabled and device.type == "cuda",
                 dtype=amp_dtype,
             ):
@@ -759,18 +809,19 @@ def cmd_train(cfg: DictConfig) -> None:
                 and global_step % log_every == 0
                 and (step + 1) % grad_accum == 0
             ):
-                log_wandb(
-                    {
-                        "train/loss": stats["loss"],
-                        "train/pos_sim": stats["pos_sim"],
-                        "train/neg_sim": stats["neg_sim"],
-                        "train/emb_std": stats["emb_std"],
-                        "train/lr": lr,
-                        "train/p_digiface": p_digiface,
-                        "train/epoch": epoch,
-                    },
-                    step=global_step,
-                )
+                metrics_to_log = {
+                    "train/loss": stats["loss"],
+                    "train/pos_sim": stats["pos_sim"],
+                    "train/neg_sim": stats["neg_sim"],
+                    "train/emb_std": stats["emb_std"],
+                    "train/sim_gap": stats["pos_sim"] - stats["neg_sim"],
+                    "train/lr": lr,
+                    "train/p_digiface": p_digiface,
+                    "train/epoch": epoch,
+                }
+                # Add GPU memory metrics
+                metrics_to_log.update(log_gpu_memory())
+                log_wandb(metrics_to_log, step=global_step)
 
             pbar.set_postfix(
                 loss=f"{stats['loss']:.4f}",
@@ -780,14 +831,20 @@ def cmd_train(cfg: DictConfig) -> None:
 
         # Epoch summary
         if n_logged > 0:
+            avg_pos = epoch_pos_sum / n_logged
+            avg_neg = epoch_neg_sum / n_logged
             epoch_metrics = {
                 "epoch/loss": epoch_loss_sum / n_logged,
-                "epoch/pos_sim": epoch_pos_sum / n_logged,
-                "epoch/neg_sim": epoch_neg_sum / n_logged,
+                "epoch/pos_sim": avg_pos,
+                "epoch/neg_sim": avg_neg,
+                "epoch/sim_gap": avg_pos - avg_neg,
                 "epoch/emb_std": epoch_embstd_sum / n_logged,
                 "epoch/lr": lr,
                 "epoch/p_digiface": p_digiface,
+                "epoch/number": epoch,
             }
+            # Add GPU memory at epoch end
+            epoch_metrics.update(log_gpu_memory())
             if wandb_active:
                 log_wandb(epoch_metrics, step=global_step)
 
