@@ -618,6 +618,8 @@ def cmd_train(cfg: DictConfig) -> None:
     # Must be AFTER loading checkpoint since compiled models have different state structure
     # NOTE: Requires Triton which is Linux-only; skipped on Windows
     if device.type == "cuda" and sys.platform != "win32":
+        # Allow torch.compile to handle .item() calls in the queue logic
+        torch._dynamo.config.capture_scalar_outputs = True
         model = torch.compile(model, mode="reduce-overhead")
         logger.info("Applied torch.compile with reduce-overhead mode")
     elif device.type == "cuda":
