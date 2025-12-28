@@ -100,6 +100,7 @@ train:
     amp: true
     amp_dtype: "fp16"
     tf32_matmul: true
+    torch_compile: false  # Enable on native Linux (RunPod), disable on WSL2
 
   batch:
     size: 128

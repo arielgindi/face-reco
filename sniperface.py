@@ -615,18 +615,19 @@ def cmd_train(cfg: DictConfig) -> None:
         )
 
     # torch.compile for JIT optimization (15-30% speedup after first epoch)
-    # Must be AFTER loading checkpoint since compiled models have different state structure
-    # NOTE: Requires Triton which is Linux-only; skipped on Windows
-    if device.type == "cuda" and sys.platform != "win32":
+    # Controlled by config - disable on WSL2, enable on native Linux (RunPod)
+    use_torch_compile = bool(cfg.train.precision.get("torch_compile", False))
+    if device.type == "cuda" and sys.platform != "win32" and use_torch_compile:
         # Allow torch.compile to handle .item() calls in the queue logic
         torch._dynamo.config.capture_scalar_outputs = True
         model = torch.compile(model, mode="reduce-overhead")
         logger.info("Applied torch.compile with reduce-overhead mode")
-    elif device.type == "cuda":
+    elif device.type == "cuda" and sys.platform == "win32":
         logger.info("Skipping torch.compile (Triton not available on Windows)")
+    elif device.type == "cuda" and not use_torch_compile:
+        logger.info("Skipping torch.compile (disabled in config)")
 
-    if wandb_active:
-        wandb.watch(model, log="gradients", log_freq=log_every * 10)
+    # NOTE: wandb.watch removed - causes 10x slowdown by hooking every backward pass
 
     # Transforms
     input_size = tuple(cfg.model.backbone.input_size)
