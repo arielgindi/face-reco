@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import sys
+import time
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
@@ -368,43 +369,25 @@ def prewarm_datasets(
     num_workers: int,
     device: torch.device,
 ) -> None:
-    """Pre-warm both datasets by iterating one sample from each.
+    """Pre-warm both datasets in parallel by iterating one sample from each.
 
     This initializes file handles and DataLoader workers for both datasets
     BEFORE the curriculum switch at epoch 16, preventing Windows deadlocks.
     """
+    import concurrent.futures
+
     if num_workers <= 0:
         logger.info("Skipping dataset pre-warm (num_workers=0)")
         return
 
     logger.info("Pre-warming datasets to initialize workers...")
 
-    # Pre-warm digiface
-    warm_ds = dataio.CurriculumMixTwoViewDataset(
-        digiface=digiface_ds,
-        digi2real=None,
-        p_digiface=1.0,
-        num_samples=num_workers * 2,  # Enough to engage all workers
-        seed=0,
-    )
-    warm_loader = DataLoader(
-        warm_ds,
-        batch_size=1,
-        num_workers=num_workers,
-        pin_memory=(device.type == "cuda"),
-        persistent_workers=False,  # Don't persist for warmup
-    )
-    for _batch in warm_loader:
-        break  # Just need one batch to initialize
-    del warm_loader, warm_ds
-    logger.info("  DigiFace dataset warmed")
-
-    # Pre-warm digi2real if available
-    if digi2real_ds is not None:
+    def warm_one(ds: dataio.ParquetTwoViewDataset, name: str, p_digi: float) -> str:
+        """Warm a single dataset."""
         warm_ds = dataio.CurriculumMixTwoViewDataset(
             digiface=digiface_ds,
-            digi2real=digi2real_ds,
-            p_digiface=0.0,  # Force digi2real
+            digi2real=ds if p_digi < 1.0 else None,
+            p_digiface=p_digi,
             num_samples=num_workers * 2,
             seed=0,
         )
@@ -418,7 +401,16 @@ def prewarm_datasets(
         for _batch in warm_loader:
             break
         del warm_loader, warm_ds
-        logger.info("  Digi2Real dataset warmed")
+        return f"  {name} dataset warmed"
+
+    # Run warmups in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [executor.submit(warm_one, digiface_ds, "DigiFace", 1.0)]
+        if digi2real_ds is not None:
+            futures.append(executor.submit(warm_one, digi2real_ds, "Digi2Real", 0.0))
+
+        for future in concurrent.futures.as_completed(futures):
+            logger.info(future.result())
 
     logger.info("Dataset pre-warming complete")
 
@@ -584,9 +576,9 @@ def cmd_train(cfg: DictConfig) -> None:
     # Build model with performance optimizations
     model = moco.build_moco(cfg, device=device)
 
-    # Channels-last memory format for better Tensor Core utilization on RTX 4070 Ti
-    model = model.to(memory_format=torch.channels_last)
-    logger.info("Applied channels_last memory format")
+    # NOTE: channels_last disabled - was causing 10x slowdown on Windows
+    # model = model.to(memory_format=torch.channels_last)
+    # logger.info("Applied channels_last memory format")
 
     model.train()
     num_params = sum(p.numel() for p in model.parameters())
@@ -759,12 +751,15 @@ def cmd_train(cfg: DictConfig) -> None:
         epoch_neg_sum = 0.0
         epoch_embstd_sum = 0.0
         n_logged = 0
+        epoch_start_time = time.perf_counter()
+        images_processed = 0
 
         pbar = tqdm(loader, total=num_batches, desc=f"epoch {epoch:03d}", unit="batch")
         for step, (im_q, im_k) in enumerate(pbar):
-            # Move to device and convert to channels_last for Tensor Core optimization
-            im_q = im_q.to(device, non_blocking=True, memory_format=torch.channels_last)
-            im_k = im_k.to(device, non_blocking=True, memory_format=torch.channels_last)
+            images_processed += im_q.shape[0]
+            # Move to device
+            im_q = im_q.to(device, non_blocking=True)
+            im_k = im_k.to(device, non_blocking=True)
 
             with torch.amp.autocast(
                 "cuda",
@@ -823,13 +818,21 @@ def cmd_train(cfg: DictConfig) -> None:
                 metrics_to_log.update(log_gpu_memory())
                 log_wandb(metrics_to_log, step=global_step)
 
+            # Calculate images/sec
+            elapsed = time.perf_counter() - epoch_start_time
+            img_per_sec = images_processed / elapsed if elapsed > 0 else 0
+
             pbar.set_postfix(
                 loss=f"{stats['loss']:.4f}",
                 pos=f"{stats['pos_sim']:.3f}",
                 neg=f"{stats['neg_sim']:.3f}",
+                img_s=f"{img_per_sec:.0f}",
             )
 
         # Epoch summary
+        epoch_elapsed = time.perf_counter() - epoch_start_time
+        epoch_img_per_sec = images_processed / epoch_elapsed if epoch_elapsed > 0 else 0
+
         if n_logged > 0:
             avg_pos = epoch_pos_sum / n_logged
             avg_neg = epoch_neg_sum / n_logged
@@ -839,6 +842,7 @@ def cmd_train(cfg: DictConfig) -> None:
                 "epoch/neg_sim": avg_neg,
                 "epoch/sim_gap": avg_pos - avg_neg,
                 "epoch/emb_std": epoch_embstd_sum / n_logged,
+                "epoch/images_per_sec": epoch_img_per_sec,
                 "epoch/lr": lr,
                 "epoch/p_digiface": p_digiface,
                 "epoch/number": epoch,
@@ -851,7 +855,8 @@ def cmd_train(cfg: DictConfig) -> None:
             logger.info(
                 f"Epoch {epoch:03d}: loss={epoch_metrics['epoch/loss']:.4f}, "
                 f"pos_sim={epoch_metrics['epoch/pos_sim']:.3f}, "
-                f"neg_sim={epoch_metrics['epoch/neg_sim']:.3f}"
+                f"neg_sim={epoch_metrics['epoch/neg_sim']:.3f}, "
+                f"img/s={epoch_img_per_sec:.0f}"
             )
 
         # Checkpointing
