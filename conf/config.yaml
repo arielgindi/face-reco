@@ -1,14 +1,12 @@
 # =============================================================================
-# SniperFace: Label-Free Face Encoder Training (MoCo + MarginNCE)
+# SniperFace: Mutual-kNN Pseudo-ID Bootstrapping (75 Epochs)
 # =============================================================================
-# Hydra configuration - all settings can be overridden from command line:
-#   uv run python main.py train.epochs=100 wandb.enabled=false
+# Resume from: checkpoints/epoch_039.pt (epoch counter resets to 0)
+# Goal: Rank-1 > 90% without using identity_id during training
 # =============================================================================
 
-# Command to run: train, embed, or eval
 command: train
 
-# Hydra settings
 defaults:
   - _self_
 
@@ -24,10 +22,10 @@ hydra:
 # =============================================================================
 project:
   name: "SniperFace"
-  description: "Label-free face encoder with MoCo + MarginNCE"
+  description: "Label-free face encoder with mutual-kNN pseudo-ID bootstrapping"
 
 experiment:
-  name: "sniperface_ssl"
+  name: "sniperface_pseudo_id_v1"
   seed: 42
   deterministic: false
 
@@ -37,19 +35,16 @@ experiment:
 wandb:
   enabled: true
   project: "sniperface"
-  entity: null  # Your W&B username or team (null = default)
-  name: null    # Run name (null = auto-generated)
-  tags: ["moco", "face-ssl", "iresnet50"]
-  notes: "MoCo v2 + MarginNCE training on synthetic face data"
+  entity: null
+  name: "pseudo-id-bootstrap-75ep"
+  tags: ["moco", "pseudo-id", "mutual-knn", "iresnet50", "phase2"]
+  notes: "Mutual-kNN pseudo-ID bootstrapping from epoch_039 checkpoint. Threshold 0.72→0.52, temp=0.05, margin=0.15"
   log_every_steps: 50
-  save_artifacts: true  # Save checkpoints as W&B artifacts
+  save_artifacts: true
 
 # =============================================================================
 # Data Configuration
 # =============================================================================
-# Training automatically excludes test identities (25% by default).
-# The split is identity-disjoint: same person never appears in both sets.
-
 data:
   digiface_glob: "data/digiface1m_*.parquet"
   digi2real_glob: "data/digi2real_*.parquet"
@@ -60,9 +55,9 @@ data:
     cache_dir: ".cache/splits"
 
   streaming:
-    batch_read_rows: 2048
-    shuffle_buffer_size: 512
-    num_workers: 2
+    batch_read_rows: 4096
+    shuffle_buffer_size: 4096
+    num_workers: 4
 
 # =============================================================================
 # Model Architecture
@@ -79,36 +74,99 @@ model:
 # =============================================================================
 # Self-Supervised Learning (MoCo v2 + MarginNCE)
 # =============================================================================
+# Temperature lowered for sharper separation (crowded embedding space)
+# Margin increased to push different identities apart
+# Queue doubled for more negative diversity
 ssl:
   algorithm: "moco_v2_margin_nce"
-  queue_size: 32768
+  queue_size: 65536           # Doubled from 32K for separation
   momentum_encoder: 0.999
-  temperature: 0.07
+  temperature: 0.05           # Sharper than 0.07 (crowded space fix)
   margin_nce:
     enabled: true
-    margin: 0.10
+    margin: 0.15              # Stronger than 0.10 (push identities apart)
+
+# =============================================================================
+# Pseudo-ID Bootstrapping (TRAIN split only, no identity_id used)
+# =============================================================================
+pseudo:
+  enabled: true
+
+  # -------------------------------------------------------------------------
+  # Mutual-kNN Graph Construction
+  # -------------------------------------------------------------------------
+  knn_k: 20                   # Search k neighbors per image
+  mutual_topk: 5              # Edge kept only if mutual top-5
+
+  # Similarity threshold schedule (CRITICAL: must start above inter-ID sim of 0.62)
+  sim_threshold:
+    start: 0.72               # High precision start (above 0.62 baseline)
+    end: 0.52                 # Relax as model improves
+    decay_end_epoch: 50       # Linear decay over 50 epochs
+
+  # Cluster size bounds
+  min_cluster_size: 2         # Need 2+ images for cross-image pairs
+  max_cluster_size: 50        # Prevent identity merges
+
+  # -------------------------------------------------------------------------
+  # Refresh Schedule (end of these epochs)
+  # -------------------------------------------------------------------------
+  refresh_epochs: [4, 9, 14, 24, 34, 49, 64]
+
+  # -------------------------------------------------------------------------
+  # Positive Pair Mixing Schedule
+  # -------------------------------------------------------------------------
+  pos_mix:
+    min_same_image_prob: 0.10   # Always keep 10% aug-pairs for stability
+    schedule:
+      - start_epoch: 0
+        end_epoch: 4
+        pseudo_prob: 0.00       # Phase A: stabilize only
+      - start_epoch: 5
+        end_epoch: 9
+        pseudo_prob: 0.30       # Gentle introduction
+      - start_epoch: 10
+        end_epoch: 19
+        pseudo_prob: 0.60       # Ramp up
+      - start_epoch: 20
+        end_epoch: 34
+        pseudo_prob: 0.85       # Heavy cross-image
+      - start_epoch: 35
+        end_epoch: 10000
+        pseudo_prob: 0.90       # Maximum identity learning
+
+  # -------------------------------------------------------------------------
+  # Negative Hygiene (prevents false-negative trap)
+  # -------------------------------------------------------------------------
+  negatives:
+    mask_same_pseudo_in_queue: true     # Don't push same-cluster apart
+    mask_topk_most_similar: 8           # Also mask top-8 (likely same person)
+    reset_queue_on_refresh: true        # Clear stale pseudo-IDs
 
 # =============================================================================
 # Training Configuration
 # =============================================================================
 train:
-  epochs: 50
-  samples_per_epoch: 0  # 0 = auto (use dataset size)
-  resume: null  # Path to checkpoint to resume from (e.g., "checkpoints/epoch_015.pt")
+  epochs: 75
+  samples_per_epoch: 0
+
+  # Warm start (epoch counter resets to 0)
+  resume: "checkpoints/epoch_039.pt"
 
   precision:
     amp: true
     amp_dtype: "fp16"
     tf32_matmul: true
-    torch_compile: false  # Enable on native Linux (RunPod), disable on WSL2
+    torch_compile: false
 
   batch:
     size: 128
-    grad_accum_steps: 2  # Effective batch = 256
+    grad_accum_steps: 2       # Effective batch = 256
 
+  # Lower LR for fine-tuning from trained model
   optimizer:
     name: "sgd"
-    lr: 0.05
+    lr: 0.02                  # Lower than initial 0.05
     momentum: 0.9
     weight_decay: 5.0e-4
     nesterov: true
@@ -118,107 +176,110 @@ train:
     warmup:
       enabled: true
       epochs: 2
-      start_lr: 0.005
-    milestones: [10, 20, 30, 40]
-    gamma: 0.1
+      start_lr: 0.002
+    milestones: [20, 40, 60]  # Decay at phase transitions
+    gamma: 0.2                # Gentler than 0.1
 
   regularization:
     grad_clip_norm: 5.0
 
   checkpointing:
-    save_every_epochs: 1  # Save every epoch for crash recovery
-    keep_last: 0  # 0 = keep all checkpoints
+    save_every_epochs: 1
+    keep_last: 10
 
 # =============================================================================
-# Curriculum Learning Schedule
+# Curriculum Learning (Data Mixing)
 # =============================================================================
-# Controls mixing ratio between synthetic (digiface) and more realistic (digi2real) data
+# Delay Digi2Real until pseudo-IDs are stable
+# Digi2Real has 20 img/identity = higher false-negative risk
 curriculum:
   schedule:
     - start_epoch: 0
-      end_epoch: 15
-      p_digiface: 1.0    # 100% synthetic (geometry foundation)
-    - start_epoch: 16
-      end_epoch: 30
-      p_digiface: 0.5    # 50/50 mix (texture adaptation)
-    - start_epoch: 31
+      end_epoch: 19
+      p_digiface: 1.0         # 100% clean DigiFace during bootstrap
+    - start_epoch: 20
+      end_epoch: 39
+      p_digiface: 0.7         # Gradual realism introduction
+    - start_epoch: 40
       end_epoch: 10000
-      p_digiface: 0.3    # 30/70 favoring realistic (realism hardening)
+      p_digiface: 0.35        # Heavy Digi2Real for final robustness
 
 # =============================================================================
-# Augmentations (Two-View for Contrastive Learning)
+# Augmentations (Face-Safe: Preserve Identity)
 # =============================================================================
+# Conservative settings to avoid destroying facial features
+# Original scale=[0.20,1.00] could crop away 80% of face
 augmentation:
   view_1:
     random_resized_crop:
-      scale: [0.20, 1.00]
-      ratio: [0.75, 1.33]
+      scale: [0.75, 1.00]     # Tight crop (was 0.20)
+      ratio: [0.92, 1.08]     # Near-square for faces
     horizontal_flip_p: 0.5
     randaugment:
-      num_ops: 4
-      magnitude: 16
+      num_ops: 2              # Reduced (was 4)
+      magnitude: 9            # Reduced (was 16)
     color_jitter:
       p: 0.8
-      brightness: 0.4
-      contrast: 0.4
-      saturation: 0.4
-      hue: 0.1
-    grayscale_p: 0.2
+      brightness: 0.25        # Reduced (was 0.4)
+      contrast: 0.25
+      saturation: 0.25
+      hue: 0.06               # Reduced (was 0.1)
+    grayscale_p: 0.08
     gaussian_blur:
-      p: 0.5
-      sigma: [0.1, 2.0]
+      p: 0.35
+      sigma: [0.1, 1.2]
     jpeg_compression:
-      p: 0.3
-      quality: [30, 95]
+      p: 0.45
+      quality: [40, 95]
     iso_noise:
-      p: 0.2
-      sigma: [0.0, 0.08]
+      p: 0.20
+      sigma: [0.0, 0.05]
     cutout:
-      p: 0.2
+      p: 0.20
       holes: 1
-      size_ratio: [0.10, 0.30]
+      size_ratio: [0.05, 0.15]  # Smaller (was 0.10-0.30)
 
   view_2:
     random_resized_crop:
-      scale: [0.20, 1.00]
-      ratio: [0.75, 1.33]
+      scale: [0.75, 1.00]
+      ratio: [0.92, 1.08]
     horizontal_flip_p: 0.5
     randaugment:
-      num_ops: 4
-      magnitude: 16
+      num_ops: 2
+      magnitude: 9
     color_jitter:
       p: 0.8
-      brightness: 0.4
-      contrast: 0.4
-      saturation: 0.4
-      hue: 0.1
-    grayscale_p: 0.2
+      brightness: 0.25
+      contrast: 0.25
+      saturation: 0.25
+      hue: 0.06
+    grayscale_p: 0.08
     gaussian_blur:
-      p: 0.2
-      sigma: [0.1, 2.0]
+      p: 0.20
+      sigma: [0.1, 1.0]
     jpeg_compression:
-      p: 0.3
-      quality: [30, 95]
+      p: 0.45
+      quality: [40, 95]
     iso_noise:
-      p: 0.2
-      sigma: [0.0, 0.08]
+      p: 0.20
+      sigma: [0.0, 0.05]
     cutout:
-      p: 0.2
+      p: 0.20
       holes: 1
-      size_ratio: [0.10, 0.30]
+      size_ratio: [0.05, 0.15]
 
 # =============================================================================
-# Embedding Export (for evaluation)
+# Embedding Export
 # =============================================================================
 embed:
-  split: "test"  # Which split to embed: "train" or "test"
+  split: "test"
   batch_size: 256
   amp: true
 
 # =============================================================================
-# Evaluation Metrics
+# Evaluation
 # =============================================================================
 eval:
-  enroll_per_id: 5
+  enroll_per_id: 2            # Guarantees queries exist for 5-image identities
   top_k: 5
   query_batch: 50000
