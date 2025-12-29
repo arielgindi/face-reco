@@ -12,6 +12,7 @@ Controls: [+] add worker  [-] remove worker  [q] quit
 import sys
 import time
 import os
+import glob
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
@@ -20,7 +21,10 @@ import numpy as np
 import pyarrow.parquet as pq
 from tqdm import tqdm
 
-from src.data.file_utils import list_parquet_files
+
+def list_parquet_files(glob_pattern: str) -> list[Path]:
+    """Return sorted parquet file paths for a glob pattern."""
+    return sorted(Path(p) for p in glob.glob(glob_pattern, recursive=True))
 
 # Config
 OUTPUT_DIR = Path("/dev/shm/face_cache")
