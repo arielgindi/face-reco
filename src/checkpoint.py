@@ -40,8 +40,8 @@ def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
         tmp_dir = Path(tempfile.gettempdir()) / "wandb_checkpoints"
         tmp_dir.mkdir(exist_ok=True)
         artifact_dir = Path(artifact.download(root=str(tmp_dir)))
-        # Find the .pt file in the artifact
-        pt_files = list(artifact_dir.glob("*.pt"))
+        # Find the .pt file in the artifact - sort by epoch number to get newest
+        pt_files = sorted(artifact_dir.glob("epoch_*.pt"), reverse=True)
         if pt_files:
             logger.info(f"Found checkpoint in W&B: {artifact.name}")
             return pt_files[0]
