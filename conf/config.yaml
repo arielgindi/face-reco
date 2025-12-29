@@ -160,9 +160,9 @@ train:
   epochs: 75
   samples_per_epoch: 0
 
-  # Warm start (epoch counter resets to 0, optimizer/pseudo state cleared)
-  resume: "checkpoints_v1/epoch_039.pt"
-  warm_start: true  # Reset epoch to 0, only load model weights
+  # Resume: "auto" (W&B → local → crash), specific path, or null/false for fresh start
+  resume: "auto"
+  warm_start: false
 
   precision:
     amp: true
@@ -197,6 +197,7 @@ train:
   checkpointing:
     save_every_epochs: 1
     keep_last: 10
+    save_local: false  # Only save to W&B by default
 
 # =============================================================================
 # Curriculum Learning (Data Mixing)

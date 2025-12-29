@@ -19,6 +19,7 @@ import wandb
 from src import data
 from src.augmentations import build_view_transform
 from src.checkpoint import (
+    find_latest_checkpoint,
     load_checkpoint_for_resume,
     prewarm_datasets,
     prune_checkpoints,
@@ -155,9 +156,16 @@ def cmd_train(cfg: DictConfig) -> None:
 
     # Resume checkpoint
     start_epoch = 0
-    if cfg.train.get("resume"):
+    resume = cfg.train.get("resume", "auto")
+    if resume:
+        if resume == "auto":
+            # Find latest from W&B or local
+            wandb_project = cfg.get("wandb", {}).get("project", "")
+            resume_path = find_latest_checkpoint(wandb_project, out_dir / "checkpoints")
+        else:
+            resume_path = Path(resume)
         start_epoch = load_checkpoint_for_resume(
-            cfg.train.resume, model, optimizer, scaler, device,
+            resume_path, model, optimizer, scaler, device,
             pseudo_manager=pseudo_mgr, warm_start=bool(cfg.train.get("warm_start", False)),
         )
 
@@ -197,6 +205,7 @@ def cmd_train(cfg: DictConfig) -> None:
     reset_queue = bool(neg_cfg.get("reset_queue_on_refresh", True))
     grad_clip = float(cfg.train.regularization.grad_clip_norm)
     save_every, keep_last = int(cfg.train.checkpointing.save_every_epochs), int(cfg.train.checkpointing.keep_last)
+    save_local = bool(cfg.train.checkpointing.get("save_local", False))
 
     if sys.platform == "win32":
         prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
@@ -323,12 +332,13 @@ def cmd_train(cfg: DictConfig) -> None:
         # Checkpoint
         if (epoch + 1) % save_every == 0 or epoch + 1 == epochs:
             path = save_checkpoint(out_dir, epoch=epoch+1, model=model, optimizer=optimizer, scaler=scaler, cfg=cfg, pseudo_manager=pseudo_mgr)
-            prune_checkpoints(out_dir / "checkpoints", keep_last)
-            logger.info(f"Saved: {path.name}")
+
+            # Upload to W&B
             if wandb_active and cfg.get("wandb", {}).get("save_artifacts"):
                 art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch+1})
                 art.add_file(str(path))
                 wandb.log_artifact(art)
+                logger.info(f"Uploaded: {path.name}")
                 # Prune old artifact versions, keep last 5
                 try:
                     api = wandb.Api()
@@ -338,6 +348,13 @@ def cmd_train(cfg: DictConfig) -> None:
                         old.delete()
                 except Exception:
                     pass  # Don't crash training if cleanup fails
+
+            # Handle local storage
+            if save_local:
+                prune_checkpoints(out_dir / "checkpoints", keep_last)
+                logger.info(f"Saved locally: {path.name}")
+            else:
+                path.unlink(missing_ok=True)  # Delete after W&B upload
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
