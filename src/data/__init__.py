@@ -1,5 +1,6 @@
 """Data module - file utilities, splits, and datasets."""
 
+from src.data.binary_dataset import BinaryImageDataset, BinaryMixDataset
 from src.data.datasets import (
     CurriculumMixTwoViewDataset,
     ParquetEmbedDataset,
@@ -25,6 +26,8 @@ from src.data.splits import (
 )
 
 __all__ = [
+    "BinaryImageDataset",
+    "BinaryMixDataset",
     "CurriculumMixTwoViewDataset",
     "PILImage",
     "ParquetEmbedDataset",

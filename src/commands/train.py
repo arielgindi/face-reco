@@ -17,7 +17,7 @@ from tqdm import tqdm
 
 import wandb
 from src import data
-from src.augmentations import build_view_transform
+from src.augmentations import build_album_transform, build_view_transform
 from src.checkpoint import (
     find_latest_checkpoint,
     load_checkpoint_for_resume,
@@ -176,21 +176,34 @@ def cmd_train(cfg: DictConfig) -> None:
 
     # Datasets
     input_size = tuple(cfg.model.backbone.input_size)
-    t_q = build_view_transform(cfg.augmentation.view_1, input_size=input_size)
-    t_k = build_view_transform(cfg.augmentation.view_2, input_size=input_size)
     stream_cfg = data_cfg.get("streaming", {})
-    stream = data.StreamParams(
-        shuffle_files=True, batch_read_rows=int(stream_cfg.get("batch_read_rows", 2048)),
-        shuffle_within_batch=True, shuffle_buffer_size=int(stream_cfg.get("shuffle_buffer_size", 10000)), seed=seed,
-    )
-    digiface_ds = data.ParquetTwoViewDataset(digiface_glob, t_q, t_k, stream=stream, allowed_identities=train_ids)
-    digi2real_ds = data.ParquetTwoViewDataset(digi2real_glob, t_q, t_k, stream=stream, allowed_identities=train_ids) if digi2real_glob else None
+    num_workers = int(stream_cfg.get("num_workers", 4))
 
-    base_samples = int(cfg.train.get("samples_per_epoch", 0)) or data.count_parquet_rows(digiface_glob)
+    # Check for binary cache (pre-decoded images for max speed)
+    binary_cache = data_cfg.get("binary_cache_path")
+    use_binary = binary_cache and Path(binary_cache).exists()
+
+    if use_binary:
+        logger.info(f"Using binary cache: {binary_cache}")
+        t_q = build_album_transform(cfg.augmentation.view_1, input_size=input_size)
+        t_k = build_album_transform(cfg.augmentation.view_2, input_size=input_size)
+        digiface_ds = data.BinaryImageDataset(binary_cache, t_q, t_k, seed=seed)
+        digi2real_ds = None  # Binary mode uses single pre-merged dataset
+        base_samples = len(digiface_ds)
+    else:
+        t_q = build_view_transform(cfg.augmentation.view_1, input_size=input_size)
+        t_k = build_view_transform(cfg.augmentation.view_2, input_size=input_size)
+        stream = data.StreamParams(
+            shuffle_files=True, batch_read_rows=int(stream_cfg.get("batch_read_rows", 2048)),
+            shuffle_within_batch=True, shuffle_buffer_size=int(stream_cfg.get("shuffle_buffer_size", 10000)), seed=seed,
+        )
+        digiface_ds = data.ParquetTwoViewDataset(digiface_glob, t_q, t_k, stream=stream, allowed_identities=train_ids)
+        digi2real_ds = data.ParquetTwoViewDataset(digi2real_glob, t_q, t_k, stream=stream, allowed_identities=train_ids) if digi2real_glob else None
+        base_samples = int(cfg.train.get("samples_per_epoch", 0)) or data.count_parquet_rows(digiface_glob)
+
     num_batches, num_samples = compute_epoch_batch_counts(
         base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
     )
-    num_workers = int(stream_cfg.get("num_workers", 4))
 
     # Log config summary
     _log_config(cfg, device, num_params, len(train_ids), num_samples, num_batches, start_epoch)
@@ -232,13 +245,21 @@ def cmd_train(cfg: DictConfig) -> None:
                 model.reset_queue()
 
         # Build epoch dataset
-        curr_ds = data.CurriculumMixTwoViewDataset(digiface_ds, digi2real_ds, p_digi, num_samples, seed + epoch * 17)
-        use_pseudo = pseudo_mgr and pseudo_mgr.state is not None
-        epoch_ds = data.PseudoPairTwoViewDataset(curr_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17) if use_pseudo else curr_ds
+        if use_binary:
+            # Binary mode: direct iteration, no curriculum/pseudo (pre-merged data)
+            epoch_ds = data.BinaryMixDataset(digiface_ds, None, 1.0, num_samples, seed + epoch * 17)
+            use_pseudo = False
+        else:
+            curr_ds = data.CurriculumMixTwoViewDataset(digiface_ds, digi2real_ds, p_digi, num_samples, seed + epoch * 17)
+            use_pseudo = pseudo_mgr and pseudo_mgr.state is not None
+            epoch_ds = data.PseudoPairTwoViewDataset(curr_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17) if use_pseudo else curr_ds
 
         loader_kw = {"batch_size": batch_size, "num_workers": num_workers, "pin_memory": device.type == "cuda", "drop_last": True}
         if num_workers > 0:
             loader_kw.update(persistent_workers=True, prefetch_factor=2)
+            # Use fork for binary mode (COW memory sharing)
+            if use_binary and sys.platform != "win32":
+                loader_kw["multiprocessing_context"] = "fork"
         loader = DataLoader(epoch_ds, **loader_kw)
 
         # Epoch tracking
