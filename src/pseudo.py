@@ -109,6 +109,7 @@ class PseudoIDManager:
     state: PseudoIDState | None = field(default=None, init=False)
     current_threshold: float = field(default=0.0, init=False)
     _image_bytes_cache: dict[int, bytes] = field(default_factory=dict, init=False)
+    _binary_images: np.ndarray | None = field(default=None, init=False)  # Reference to binary dataset
 
     def __post_init__(self) -> None:
         """Initialize current threshold to start value."""
@@ -126,11 +127,18 @@ class PseudoIDManager:
         """Clear all pseudo-ID state and cached images."""
         self.state = None
         self._image_bytes_cache.clear()
+        self._binary_images = None
         self.current_threshold = self.threshold_start
 
     def get_threshold(self) -> float:
         """Get current similarity threshold for pseudo-ID mining."""
         return self.current_threshold
+
+    def get_image(self, idx: int) -> np.ndarray | bytes | None:
+        """Get image by index - returns numpy array (binary) or bytes (parquet)."""
+        if self._binary_images is not None:
+            return self._binary_images[idx] if 0 <= idx < len(self._binary_images) else None
+        return self._image_bytes_cache.get(idx)
 
     def adapt_threshold(self, coverage: float) -> None:
         """Adapt threshold based on coverage (called after each refresh).
@@ -197,7 +205,15 @@ class PseudoIDManager:
             last_refresh_epoch=epoch,
             sim_threshold_used=sim_threshold,
         )
-        self._image_bytes_cache = dict(enumerate(image_bytes_list))
+        # Store image references - for binary mode, store dataset reference; for parquet, store bytes
+        if image_bytes_list and isinstance(image_bytes_list[0], bytes) and len(image_bytes_list[0]) == 4:
+            # Binary mode: image_bytes_list contains indices, store reference to binary dataset
+            self._binary_images = datasets[0].images if hasattr(datasets[0], 'images') else None
+            self._image_bytes_cache.clear()
+        else:
+            # Parquet mode: store actual bytes
+            self._binary_images = None
+            self._image_bytes_cache = dict(enumerate(image_bytes_list))
 
         elapsed = time.perf_counter() - start_time
         accept_rate = num_clustered / num_images if num_images > 0 else 0.0
@@ -226,20 +242,24 @@ class PseudoIDManager:
         model.eval()
         all_embeddings, all_image_bytes = [], []
 
-        for ds_idx, dataset in enumerate(datasets):
+        # Use larger batch size for inference (no gradients needed) and more workers
+        embed_batch_size = batch_size * 4
+        embed_workers = max(8, num_workers * 2)
+
+        for dataset in datasets:
             simple_ds = _SimpleImageDataset(dataset)
-            total_batches = (len(simple_ds) + batch_size - 1) // batch_size
-            loader = DataLoader(simple_ds, batch_size=batch_size,
-                                num_workers=num_workers, pin_memory=device.type == "cuda")
-            with torch.no_grad():
+            total_batches = (len(simple_ds) + embed_batch_size - 1) // embed_batch_size
+            loader = DataLoader(simple_ds, batch_size=embed_batch_size,
+                                num_workers=embed_workers, pin_memory=device.type == "cuda")
+            with torch.no_grad(), torch.amp.autocast("cuda", enabled=device.type == "cuda"):
                 for batch_idx, (images, image_bytes_batch) in enumerate(loader):
                     embeddings = l2_normalize(model.backbone_k(images.to(device, non_blocking=True)), dim=1)
-                    all_embeddings.append(embeddings.cpu())
+                    all_embeddings.append(embeddings.float().cpu())
                     all_image_bytes.extend(image_bytes_batch)
                     # Log progress every 10%
                     if (batch_idx + 1) % max(1, total_batches // 10) == 0 or batch_idx == total_batches - 1:
                         pct = (batch_idx + 1) / total_batches * 100
-                        logger.info(f"        Embedding: {pct:.0f}% ({(batch_idx + 1) * batch_size:,}/{len(simple_ds):,})")
+                        logger.info(f"        Embedding: {pct:.0f}% ({(batch_idx + 1) * embed_batch_size:,}/{len(simple_ds):,})")
 
         model.train()
         return torch.cat(all_embeddings).numpy().astype(np.float32), all_image_bytes
@@ -252,15 +272,19 @@ class PseudoIDManager:
         try:
             import faiss
             index = faiss.IndexFlatIP(embed_dim)
+            backend = "FAISS-CPU"
             try:
                 gpu_resources = faiss.StandardGpuResources()
                 gpu_resources.setTempMemory(1 << 30)  # 1GB
                 index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
-            except Exception:
-                pass  # Fall back to CPU
+                backend = "FAISS-GPU"
+            except Exception as e:
+                logger.debug(f"FAISS GPU unavailable: {e}")
+            logger.info(f"        k-NN backend: {backend}")
             index.add(embeddings)
             similarities, indices = index.search(embeddings, search_k)
         except ImportError:
+            logger.info("        k-NN backend: sklearn (slow)")
             from sklearn.neighbors import NearestNeighbors
             nn_model = NearestNeighbors(n_neighbors=search_k, metric="cosine").fit(embeddings)
             distances, indices = nn_model.kneighbors(embeddings)
@@ -331,26 +355,17 @@ class PseudoIDManager:
 
 
 class _SimpleImageDataset(Dataset):
-    """Simple dataset returning (tensor, bytes) without augmentation for embedding.
+    """Dataset for embedding - returns (tensor, index/bytes) without augmentation."""
 
-    Supports both ParquetTwoViewDataset and BinaryImageDataset as input.
-    """
-
-    def __init__(self, dataset: ParquetTwoViewDataset | BinaryImageDataset, input_size: tuple[int, int] = (112, 112)):
-        self._transform = transforms.Compose([
-            transforms.Resize(input_size),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
-        ])
-
+    def __init__(self, dataset: ParquetTwoViewDataset | BinaryImageDataset):
         # Check if this is a binary dataset
         if isinstance(dataset, BinaryImageDataset):
             self._is_binary = True
             self._binary_images: np.ndarray = dataset.images
-            self._rows: list[tuple[bytes, str]] = []  # Empty, not used for binary
+            self._rows: list[tuple[bytes, str]] = []
         else:
             self._is_binary = False
-            self._binary_images = np.array([])  # Empty, not used for parquet
+            self._binary_images = np.array([])
             self._rows = []
             from src.data.file_utils import list_parquet_files
             for path in list_parquet_files(dataset.parquet_glob):
@@ -361,21 +376,19 @@ class _SimpleImageDataset(Dataset):
                         self._rows.append((table["image_bytes"][i].as_py(), identity_id))
 
     def __len__(self) -> int:
-        if self._is_binary:
-            return len(self._binary_images)
-        return len(self._rows)
+        return len(self._binary_images) if self._is_binary else len(self._rows)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, bytes]:
         if self._is_binary:
-            # Binary dataset: image is numpy array (H, W, 3) uint8
-            img_array = self._binary_images[idx]
-            image = Image.fromarray(img_array, mode="RGB")
-            # Convert to JPEG bytes for caching (smaller than PNG)
-            buf = io.BytesIO()
-            image.save(buf, format="JPEG", quality=95)
-            image_bytes = buf.getvalue()
+            # Fast path: direct numpy->tensor, no PIL
+            img = self._binary_images[idx]  # (H, W, 3) uint8
+            tensor = torch.from_numpy(img).permute(2, 0, 1).float().div_(255.0)
+            tensor = (tensor - 0.5) / 0.5  # Normalize to [-1, 1]
+            return tensor, idx.to_bytes(4, "little")
         else:
-            # Parquet dataset: image is already bytes
+            # Parquet: decode and transform
             image_bytes, _ = self._rows[idx]
             image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        return self._transform(image), image_bytes
+            tensor = transforms.functional.to_tensor(image)
+            tensor = (tensor - 0.5) / 0.5
+            return tensor, image_bytes
