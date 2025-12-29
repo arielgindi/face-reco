@@ -109,7 +109,8 @@ class PseudoIDManager:
     state: PseudoIDState | None = field(default=None, init=False)
     current_threshold: float = field(default=0.0, init=False)
     _image_bytes_cache: dict[int, bytes] = field(default_factory=dict, init=False)
-    _binary_images: np.ndarray | None = field(default=None, init=False)  # Reference to binary dataset
+    _binary_images: np.ndarray | None = field(default=None, init=False)
+    _embed_start_time: float = field(default=0.0, init=False)
 
     def __post_init__(self) -> None:
         """Initialize current threshold to start value."""
@@ -171,9 +172,11 @@ class PseudoIDManager:
         # Step 1: Embed all training images
         logger.info("  [1/4] Embedding all images...")
         t0 = time.perf_counter()
+        self._embed_start_time = t0  # For speed calculation
         embeddings, image_bytes_list = self._embed_all(model, datasets, device, batch_size, num_workers)
         num_images = len(embeddings)
-        logger.info(f"  [1/4] Embedded {num_images:,} images in {time.perf_counter() - t0:.1f}s")
+        embed_time = time.perf_counter() - t0
+        logger.info(f"  [1/4] Embedded {num_images:,} images in {embed_time:.1f}s ({num_images/embed_time:,.0f} img/s)")
 
         # Step 2: Build kNN graph
         logger.info(f"  [2/4] Building k-NN graph (k={self.knn_k})...")
@@ -237,12 +240,16 @@ class PseudoIDManager:
 
     def _embed_all(self, model: MoCo, datasets: list[ParquetTwoViewDataset], device: torch.device,
                    batch_size: int, num_workers: int) -> tuple[np.ndarray, list[bytes]]:
-        """Embed all images using momentum encoder (no augmentation)."""
+        """Embed all images using momentum encoder - optimized for speed."""
         from src.model import l2_normalize
         model.eval()
-        all_embeddings, all_image_bytes = [], []
 
-        # Use larger batch size for inference (no gradients needed) and more workers
+        # Check if we have a binary dataset (fast path)
+        if hasattr(datasets[0], 'images'):
+            return self._embed_binary_fast(model, datasets[0].images, device)
+
+        # Fallback for parquet datasets
+        all_embeddings, all_image_bytes = [], []
         embed_batch_size = batch_size * 4
         embed_workers = max(8, num_workers * 2)
 
@@ -250,39 +257,91 @@ class PseudoIDManager:
             simple_ds = _SimpleImageDataset(dataset)
             total_batches = (len(simple_ds) + embed_batch_size - 1) // embed_batch_size
             loader = DataLoader(simple_ds, batch_size=embed_batch_size,
-                                num_workers=embed_workers, pin_memory=device.type == "cuda")
-            with torch.no_grad(), torch.amp.autocast("cuda", enabled=device.type == "cuda"):
+                                num_workers=embed_workers, pin_memory=True)
+            with torch.no_grad(), torch.amp.autocast("cuda"):
                 for batch_idx, (images, image_bytes_batch) in enumerate(loader):
                     embeddings = l2_normalize(model.backbone_k(images.to(device, non_blocking=True)), dim=1)
                     all_embeddings.append(embeddings.float().cpu())
                     all_image_bytes.extend(image_bytes_batch)
-                    # Log progress every 10%
-                    if (batch_idx + 1) % max(1, total_batches // 10) == 0 or batch_idx == total_batches - 1:
-                        pct = (batch_idx + 1) / total_batches * 100
-                        logger.info(f"        Embedding: {pct:.0f}% ({(batch_idx + 1) * embed_batch_size:,}/{len(simple_ds):,})")
+                    if (batch_idx + 1) % max(1, total_batches // 10) == 0:
+                        logger.info(f"        Embedding: {(batch_idx + 1) / total_batches * 100:.0f}%")
 
         model.train()
         return torch.cat(all_embeddings).numpy().astype(np.float32), all_image_bytes
 
+    def _embed_binary_fast(self, model: MoCo, images: np.ndarray, device: torch.device) -> tuple[np.ndarray, list[bytes]]:
+        """Ultra-fast embedding for binary datasets - skip DataLoader entirely."""
+        from src.model import l2_normalize
+
+        num_images = len(images)
+        embed_dim = 512  # Model output dimension
+        batch_size = 8192  # Large batch for GPU utilization
+
+        # Pre-allocate output tensor on CPU (pinned memory for fast transfer)
+        all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32, pin_memory=True)
+
+        total_batches = (num_images + batch_size - 1) // batch_size
+        log_interval = max(1, total_batches // 10)
+
+        with torch.no_grad(), torch.amp.autocast("cuda"):
+            for batch_idx in range(total_batches):
+                start_idx = batch_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_images)
+
+                # Direct numpy -> GPU tensor (skip CPU tensor intermediate)
+                batch_np = images[start_idx:end_idx]  # (B, H, W, 3) uint8
+                batch_gpu = torch.from_numpy(batch_np).to(device, non_blocking=True)
+                # HWC uint8 -> CHW float32 normalized in one go
+                batch_gpu = batch_gpu.permute(0, 3, 1, 2).float().div_(255.0).sub_(0.5).div_(0.5)
+
+                # Forward pass
+                embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
+                all_embeddings[start_idx:end_idx] = embeddings.float().cpu()
+
+                if (batch_idx + 1) % log_interval == 0 or batch_idx == total_batches - 1:
+                    pct = (batch_idx + 1) / total_batches * 100
+                    ips = (end_idx) / (time.perf_counter() - self._embed_start_time) if hasattr(self, '_embed_start_time') else 0
+                    logger.info(f"        Embedding: {pct:.0f}% ({end_idx:,}/{num_images:,})")
+
+        model.train()
+        # Return indices as bytes for binary mode
+        image_bytes = [i.to_bytes(4, "little") for i in range(num_images)]
+        return all_embeddings.numpy(), image_bytes
+
     def _build_knn_graph(self, embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Build kNN graph using FAISS (GPU if available) or sklearn fallback."""
+        """Build kNN graph using FAISS GPU with IVF index for speed."""
         num_images, embed_dim = embeddings.shape
         search_k = self.knn_k + 1  # +1 because first result is self
 
         try:
             import faiss
-            index = faiss.IndexFlatIP(embed_dim)
-            backend = "FAISS-CPU"
+
+            # Try GPU first
+            use_gpu = False
             try:
                 gpu_resources = faiss.StandardGpuResources()
-                gpu_resources.setTempMemory(1 << 30)  # 1GB
-                index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
-                backend = "FAISS-GPU"
+                gpu_resources.setTempMemory(2 << 30)  # 2GB temp memory
+                use_gpu = True
             except Exception as e:
                 logger.debug(f"FAISS GPU unavailable: {e}")
-            logger.info(f"        k-NN backend: {backend}")
+
+            if use_gpu:
+                # GPU: use flat index (fast enough with GPU)
+                index = faiss.IndexFlatIP(embed_dim)
+                index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
+                logger.info(f"        k-NN backend: FAISS-GPU")
+            else:
+                # CPU: use IVF index for speed (approximate but much faster)
+                nlist = min(4096, num_images // 100)  # Number of clusters
+                quantizer = faiss.IndexFlatIP(embed_dim)
+                index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
+                index.nprobe = 64  # Search this many clusters
+                logger.info(f"        k-NN backend: FAISS-CPU (IVF, nlist={nlist})")
+                index.train(embeddings)
+
             index.add(embeddings)
             similarities, indices = index.search(embeddings, search_k)
+
         except ImportError:
             logger.info("        k-NN backend: sklearn (slow)")
             from sklearn.neighbors import NearestNeighbors
@@ -290,14 +349,10 @@ class PseudoIDManager:
             distances, indices = nn_model.kneighbors(embeddings)
             similarities = 1.0 - distances
 
-        # Remove self-matches
-        is_not_self = indices != np.arange(num_images)[:, None]
-        knn_similarities = np.zeros((num_images, self.knn_k), dtype=np.float32)
-        knn_indices = np.zeros((num_images, self.knn_k), dtype=np.int32)
-        for i in range(num_images):
-            valid_positions = np.where(is_not_self[i])[0][:self.knn_k]
-            knn_similarities[i, :len(valid_positions)] = similarities[i, valid_positions]
-            knn_indices[i, :len(valid_positions)] = indices[i, valid_positions]
+        # Remove self-matches (vectorized, no loop)
+        # First neighbor is usually self, so take neighbors 1 to k+1
+        knn_indices = indices[:, 1:search_k].astype(np.int32)
+        knn_similarities = similarities[:, 1:search_k].astype(np.float32)
 
         return knn_similarities, knn_indices
 

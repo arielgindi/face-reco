@@ -1,13 +1,9 @@
 """
-AMD EPYC OPTIMIZED CONVERTER
-Target: AMD EPYC 9354 (32 Cores / 64 Threads)
-
+Cross-platform Binary Cache Converter
 Optimizations:
-1. Distributed Writing: Workers write directly to memmap (bypasses main thread bottleneck)
-2. CPU Saturation: Auto-scales to use ~95% of available cores
+1. Distributed Writing: Workers write directly to memmap
+2. CPU Saturation: Auto-scales to available cores
 3. Persistent Decoders: Initializes TurboJPEG once per worker
-
-Controls: [+] add worker  [-] remove worker  [q] quit
 """
 import sys
 import time
@@ -26,10 +22,14 @@ def list_parquet_files(glob_pattern: str) -> list[Path]:
     """Return sorted parquet file paths for a glob pattern."""
     return sorted(Path(p) for p in glob.glob(glob_pattern, recursive=True))
 
-# Config
-OUTPUT_DIR = Path("/dev/shm/face_cache")
+# Config - auto-detect platform
+if sys.platform == "win32":
+    OUTPUT_DIR = Path.home() / "face_cache"  # Windows: user home directory
+else:
+    OUTPUT_DIR = Path("/dev/shm/face_cache")  # Linux: shared memory
+
 BATCH_SIZE = 1024
-TOTAL_CORES = os.cpu_count()
+TOTAL_CORES = os.cpu_count() or 8
 DEFAULT_WORKERS = max(1, TOTAL_CORES - 2)
 
 
@@ -39,7 +39,7 @@ def init_worker():
     try:
         from turbojpeg import TurboJPEG
         _decoder = TurboJPEG()
-    except ImportError:
+    except Exception:
         _decoder = None
 
 
@@ -70,67 +70,93 @@ def worker_task(args):
 
 
 def get_key_nonblocking():
-    import select
-    if select.select([sys.stdin], [], [], 0)[0]:
-        return sys.stdin.read(1)
-    return None
+    """Non-blocking keyboard input (cross-platform)."""
+    if sys.platform == "win32":
+        import msvcrt
+        if msvcrt.kbhit():
+            return msvcrt.getch().decode('utf-8', errors='ignore')
+        return None
+    else:
+        import select
+        if select.select([sys.stdin], [], [], 0)[0]:
+            return sys.stdin.read(1)
+        return None
 
 
-def collect_jpeg_bytes(parquet_glob: str) -> list[bytes]:
+def count_images(parquet_glob: str) -> int:
+    """Count total images without loading data."""
+    files = list_parquet_files(parquet_glob)
+    total = 0
+    for fp in files:
+        try:
+            pf = pq.ParquetFile(fp)
+            total += pf.metadata.num_rows
+        except Exception:
+            continue
+    return total
+
+
+def iter_jpeg_bytes(parquet_glob: str):
+    """Iterate over JPEG bytes without loading all into memory."""
     files = list_parquet_files(parquet_glob)
     if not files:
         raise FileNotFoundError(f"No parquet files: {parquet_glob}")
 
     print(f"Found {len(files)} parquet files")
-    all_bytes = []
 
-    for fp in tqdm(files, desc="Loading Parquet"):
+    for fp in files:
         try:
             pf = pq.ParquetFile(fp)
-            for batch in pf.iter_batches(batch_size=10000, columns=["image_bytes"]):
-                all_bytes.extend([b for b in batch.column(0).to_pylist() if b])
+            for batch in pf.iter_batches(batch_size=BATCH_SIZE, columns=["image_bytes"]):
+                yield from (b for b in batch.column(0).to_pylist() if b)
         except Exception:
             continue
 
-    return all_bytes
-
 
 def main():
-    import termios
-    import tty
-
     # Check TurboJPEG
     try:
-        import turbojpeg
+        from turbojpeg import TurboJPEG
+        TurboJPEG()  # Test if library is available
         decoder_name = "TurboJPEG (SIMD)"
-    except ImportError:
-        decoder_name = "PIL (slow - install PyTurboJPEG)"
+    except Exception:
+        decoder_name = "PIL"
 
-    old_settings = termios.tcgetattr(sys.stdin)
-
-    try:
+    # Setup terminal for non-blocking input (Linux only)
+    old_settings = None
+    if sys.platform != "win32":
+        import termios
+        import tty
+        old_settings = termios.tcgetattr(sys.stdin)
         tty.setcbreak(sys.stdin.fileno())
 
+    try:
         print("=" * 60)
-        print("AMD EPYC MAX-PERFORMANCE CONVERTER")
+        print("BINARY CACHE CONVERTER")
         print(f"CPU: {TOTAL_CORES} threads | Decoder: {decoder_name}")
-        print("Controls: [+] add worker  [-] remove worker  [q] quit")
+        print(f"Output: {OUTPUT_DIR}")
         print("=" * 60)
 
-        # Load data
-        all_bytes = collect_jpeg_bytes("data/digiface1m_*.parquet")
-        total = len(all_bytes)
+        parquet_glob = "data/digiface1m_*.parquet"
+
+        # Count total images first
+        print("Counting images...")
+        total = count_images(parquet_glob)
         if total == 0:
+            print("No images found!")
             return
 
-        # Get image shape
+        print(f"Found {total:,} images")
+
+        # Get first image to determine shape
+        first_bytes = next(iter_jpeg_bytes(parquet_glob))
         try:
             from turbojpeg import TurboJPEG
-            first_img = TurboJPEG().decode(all_bytes[0])
-        except ImportError:
+            first_img = TurboJPEG().decode(first_bytes)
+        except Exception:
             from PIL import Image
             import io
-            first_img = np.array(Image.open(io.BytesIO(all_bytes[0])).convert("RGB"))
+            first_img = np.array(Image.open(io.BytesIO(first_bytes)).convert("RGB"))
 
         img_shape = first_img.shape
         full_shape = (total, *img_shape)
@@ -140,19 +166,13 @@ def main():
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         out_path = OUTPUT_DIR / "images.npy"
 
-        print(f"Creating {total * np.prod(img_shape) / 1e9:.1f} GB memmap: {out_path}")
+        print(f"Creating {total * np.prod(img_shape) / 1e9:.1f} GB file: {out_path}")
         fp = np.lib.format.open_memmap(str(out_path), mode='w+', dtype=dtype, shape=full_shape)
         fp[0] = first_img
         fp.flush()
         del fp  # Close, workers will open their own handles
 
-        # Create tasks
-        tasks = []
-        for i in range(1, total, BATCH_SIZE):
-            chunk = all_bytes[i:i + BATCH_SIZE]
-            tasks.append((out_path, full_shape, dtype, i, chunk))
-
-        print(f"Processing {total:,} images in {len(tasks):,} batches...")
+        print(f"Processing {total:,} images...")
 
         num_workers = DEFAULT_WORKERS
         ctx = mp.get_context('spawn')
@@ -163,7 +183,6 @@ def main():
         )
 
         futures = {}
-        next_task_idx = 0
         completed_images = 1
         active_tasks = 0
         start_time = time.time()
@@ -171,61 +190,69 @@ def main():
         pbar = tqdm(total=total, initial=1, unit="img", smoothing=0.1)
         pbar.set_description(f"Decoding (w={num_workers})")
 
-        def submit_tasks():
-            nonlocal next_task_idx, active_tasks
-            target = num_workers * 2
-            while active_tasks < target and next_task_idx < len(tasks):
-                t = tasks[next_task_idx]
-                f = executor.submit(worker_task, t)
-                futures[f] = len(t[-1])
-                next_task_idx += 1
+        # Stream batches from parquet files
+        batch = []
+        batch_start_idx = 1  # First image already written
+        jpeg_iter = iter_jpeg_bytes(parquet_glob)
+        next(jpeg_iter)  # Skip first (already processed)
+
+        for idx, jpeg_bytes in enumerate(jpeg_iter, start=1):
+            batch.append(jpeg_bytes)
+
+            if len(batch) >= BATCH_SIZE:
+                # Submit batch
+                task = (out_path, full_shape, dtype, batch_start_idx, batch)
+                f = executor.submit(worker_task, task)
+                futures[f] = len(batch)
                 active_tasks += 1
+                batch_start_idx += len(batch)
+                batch = []
 
-        submit_tasks()
+                # Limit concurrent tasks to avoid memory issues
+                while active_tasks >= num_workers * 2:
+                    done_list = [f for f in futures if f.done()]
+                    for f in done_list:
+                        batch_count = futures.pop(f)
+                        active_tasks -= 1
+                        try:
+                            f.result()
+                            completed_images += batch_count
+                            pbar.update(batch_count)
+                        except Exception as e:
+                            print(f"Batch failed: {e}")
+                    if active_tasks >= num_workers * 2:
+                        time.sleep(0.01)
 
-        while completed_images < total:
-            key = get_key_nonblocking()
-            if key == '+' and num_workers < TOTAL_CORES:
-                num_workers += 1
-                pbar.set_description(f"Decoding (w={num_workers})")
-                submit_tasks()
-            elif key == '-' and num_workers > 1:
-                num_workers -= 1
-                pbar.set_description(f"Decoding (w={num_workers})")
-            elif key == 'q':
-                break
+                elapsed = time.time() - start_time
+                if elapsed > 0:
+                    pbar.set_postfix({"ips": f"{completed_images / elapsed:.0f}"})
 
-            done_list = [f for f in futures if f.done()]
-            if not done_list:
-                time.sleep(0.001)
-                continue
+        # Submit final batch
+        if batch:
+            task = (out_path, full_shape, dtype, batch_start_idx, batch)
+            f = executor.submit(worker_task, task)
+            futures[f] = len(batch)
 
-            for f in done_list:
-                batch_count = futures.pop(f)
-                active_tasks -= 1
-
-                try:
-                    f.result()
-                    completed_images += batch_count
-                    pbar.update(batch_count)
-                except Exception as e:
-                    print(f"Batch failed: {e}")
-
-            submit_tasks()
-
-            elapsed = time.time() - start_time
-            if elapsed > 0:
-                pbar.set_postfix({"ips": f"{completed_images / elapsed:.0f}"})
+        # Wait for remaining tasks
+        for f in futures:
+            try:
+                f.result()
+                completed_images += futures[f]
+                pbar.update(futures[f])
+            except Exception as e:
+                print(f"Batch failed: {e}")
 
         pbar.close()
-        executor.shutdown(wait=False)
+        executor.shutdown(wait=True)
 
         elapsed = time.time() - start_time
         print(f"\nDone! {completed_images:,} images in {elapsed:.1f}s ({completed_images/elapsed:.0f} ips)")
         print(f"File ready at: {out_path}")
 
     finally:
-        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
+        if old_settings is not None:
+            import termios
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_settings)
 
 
 if __name__ == "__main__":

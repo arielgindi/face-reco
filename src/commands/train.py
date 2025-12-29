@@ -225,7 +225,7 @@ def cmd_train(cfg: DictConfig) -> None:
     save_every, keep_last = int(cfg.train.checkpointing.save_every_epochs), int(cfg.train.checkpointing.keep_last)
     save_local = bool(cfg.train.checkpointing.get("save_local", False))
 
-    if sys.platform == "win32":
+    if sys.platform == "win32" and not use_binary:
         prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
 
     # Training loop
