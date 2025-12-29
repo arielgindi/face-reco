@@ -1,9 +1,0 @@
-{
-  "num_identities": 27500,
-  "num_embeddings": 302789,
-  "num_queries": 165289,
-  "enroll_per_id": 5,
-  "top_k": 5,
-  "rank_1": 0.008010212415829245,
-  "top_k_acc": 0.021338383074493764
-}

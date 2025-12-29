@@ -28,7 +28,6 @@ env/
 
 # uv
 .uv/
-uv.lock
 
 # IDE
 .idea/
@@ -64,7 +63,6 @@ wandb/
 
 # Data (large files)
 data/
-*.parquet
 
 # Model checkpoints
 checkpoints/
@@ -75,8 +73,10 @@ checkpoints/
 # Cached splits
 .cache/
 
-# Embeddings
-embeddings_*.parquet
+# Generated outputs in root (should be in outputs/)
+/embeddings_*.parquet
+/metrics.json
+/identity_splits.parquet
 
 # Logs
 *.log
