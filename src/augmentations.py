@@ -30,7 +30,7 @@ class RandomJPEGCompression:
 
         q = int(np.random.randint(self.quality_min, self.quality_max + 1))
         buf = BytesIO()
-        img.save(buf, format="JPEG", quality=q, optimize=True)
+        img.save(buf, format="JPEG", quality=q, optimize=False)
         buf.seek(0)
         out = Image.open(buf).convert("RGB")
         out.load()
