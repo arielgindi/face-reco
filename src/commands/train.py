@@ -46,6 +46,96 @@ from src.wandb_utils import finish_wandb, init_wandb, log_gpu_memory, log_wandb
 logger = logging.getLogger(__name__)
 
 
+def _format_time(seconds: float) -> str:
+    """Format seconds into human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    else:
+        hours = int(seconds // 3600)
+        mins = int((seconds % 3600) // 60)
+        return f"{hours}h {mins}m"
+
+
+def _log_training_config(
+    cfg: DictConfig,
+    device: torch.device,
+    num_params: int,
+    train_identities: int,
+    num_samples: int,
+    num_batches: int,
+    start_epoch: int,
+) -> None:
+    """Log a formatted training configuration summary."""
+    ssl_cfg = cfg.get("ssl", {})
+    pseudo_cfg = cfg.get("pseudo", {})
+    train_cfg = cfg.train
+
+    # Get GPU info
+    gpu_name = "N/A"
+    gpu_mem = "N/A"
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem = f"{torch.cuda.get_device_properties(0).total_memory / 1e9:.1f}GB"
+
+    lines = [
+        "",
+        "=" * 70,
+        "  SNIPERFACE TRAINING",
+        "=" * 70,
+        "",
+        "  Hardware:",
+        f"    GPU:              {gpu_name} ({gpu_mem})",
+        f"    Precision:        {'FP16 (AMP)' if train_cfg.precision.amp else 'FP32'}",
+        "",
+        "  Model:",
+        f"    Backbone:         {cfg.model.backbone.name}",
+        f"    Parameters:       {num_params:,}",
+        f"    Embedding dim:    {cfg.model.backbone.embedding_dim}",
+        "",
+        "  SSL (MoCo + MarginNCE):",
+        f"    Queue size:       {ssl_cfg.get('queue_size', 32768):,}",
+        f"    Temperature:      {ssl_cfg.get('temperature', 0.07)}",
+        f"    Margin:           {ssl_cfg.get('margin_nce', {}).get('margin', 0.1)}",
+        "",
+        "  Training:",
+        f"    Epochs:           {start_epoch} -> {train_cfg.epochs - 1} ({train_cfg.epochs - start_epoch} total)",
+        f"    Batch size:       {train_cfg.batch.size} x {train_cfg.batch.grad_accum_steps} = {train_cfg.batch.size * train_cfg.batch.grad_accum_steps}",
+        f"    Samples/epoch:    {num_samples:,}",
+        f"    Steps/epoch:      {num_batches // train_cfg.batch.grad_accum_steps:,}",
+        f"    Learning rate:    {train_cfg.optimizer.lr} (warmup: {train_cfg.lr_schedule.warmup.epochs} epochs)",
+        "",
+        "  Data:",
+        f"    Train identities: {train_identities:,}",
+        f"    DigiFace glob:    {cfg.data.digiface_glob}",
+    ]
+
+    if cfg.data.get("digi2real_glob"):
+        lines.append(f"    Digi2Real glob:   {cfg.data.digi2real_glob}")
+
+    if pseudo_cfg.get("enabled", False):
+        threshold_cfg = pseudo_cfg.get("sim_threshold", {})
+        lines.extend([
+            "",
+            "  Pseudo-ID Mining:",
+            f"    kNN k:            {pseudo_cfg.get('knn_k', 20)}",
+            f"    Mutual top-k:     {pseudo_cfg.get('mutual_topk', 5)}",
+            f"    Sim threshold:    {threshold_cfg.get('start', 0.72)} -> {threshold_cfg.get('end', 0.52)}",
+            f"    Cluster size:     {pseudo_cfg.get('min_cluster_size', 2)}-{pseudo_cfg.get('max_cluster_size', 50)}",
+            f"    Refresh epochs:   {pseudo_cfg.get('refresh_epochs', [])}",
+        ])
+
+    lines.extend([
+        "",
+        "=" * 70,
+        "",
+    ])
+
+    for line in lines:
+        logger.info(line)
+
+
 def cmd_train(cfg: DictConfig) -> None:
     """Train MoCo + MarginNCE encoder."""
     exp_cfg = cfg.get("experiment", {})
@@ -59,10 +149,7 @@ def cmd_train(cfg: DictConfig) -> None:
         torch.backends.cudnn.allow_tf32 = True
 
     device = select_device()
-    logger.info(f"Device: {device}")
-
     out_dir = Path(os.getcwd())
-    logger.info(f"Output directory: {out_dir}")
 
     wandb_active = init_wandb(cfg, out_dir)
     wandb_cfg = cfg.get("wandb", {})
@@ -94,17 +181,11 @@ def cmd_train(cfg: DictConfig) -> None:
     )
 
     train_identities = data.get_identity_set(splits_path, "train")
-    logger.info(
-        f"Training on {len(train_identities)} identities "
-        f"({train_ratio:.0%} of total, test set protected)"
-    )
-
     shutil.copy2(splits_path, out_dir / "identity_splits.parquet")
 
     model = build_moco(cfg, device=device)
     model.train()
     num_params = sum(p.numel() for p in model.parameters())
-    logger.info(f"Model parameters: {num_params:,}")
 
     batch_size = int(cfg.train.batch.size)
     grad_accum = int(cfg.train.batch.grad_accum_steps)
@@ -135,10 +216,6 @@ def cmd_train(cfg: DictConfig) -> None:
             min_cluster_size=int(pseudo_cfg.get("min_cluster_size", 2)),
             max_cluster_size=int(pseudo_cfg.get("max_cluster_size", 50)),
         )
-        logger.info(
-            f"Pseudo-ID mining enabled: knn_k={pseudo_manager.knn_k}, "
-            f"mutual_topk={pseudo_manager.mutual_topk}"
-        )
 
     resume_path = cfg.train.get("resume")
     warm_start = bool(cfg.train.get("warm_start", False))
@@ -158,11 +235,6 @@ def cmd_train(cfg: DictConfig) -> None:
     if device.type == "cuda" and sys.platform != "win32" and use_torch_compile:
         torch._dynamo.config.capture_scalar_outputs = True
         model = torch.compile(model, mode="reduce-overhead")
-        logger.info("Applied torch.compile with reduce-overhead mode")
-    elif device.type == "cuda" and sys.platform == "win32":
-        logger.info("Skipping torch.compile (Triton not available on Windows)")
-    elif device.type == "cuda" and not use_torch_compile:
-        logger.info("Skipping torch.compile (disabled in config)")
 
     input_size = tuple(cfg.model.backbone.input_size)
     aug_cfg = cfg.augmentation
@@ -204,9 +276,16 @@ def cmd_train(cfg: DictConfig) -> None:
         batch_size=batch_size,
         grad_accum_steps=grad_accum,
     )
-    logger.info(
-        f"Epoch: {num_samples:,} samples, {num_batches:,} batches, "
-        f"batch_size={batch_size}, grad_accum={grad_accum}"
+
+    # Log training configuration summary
+    _log_training_config(
+        cfg=cfg,
+        device=device,
+        num_params=num_params,
+        train_identities=len(train_identities),
+        num_samples=num_samples,
+        num_batches=num_batches,
+        start_epoch=start_epoch,
     )
 
     sched_cfg = cfg.train.lr_schedule
@@ -250,9 +329,7 @@ def cmd_train(cfg: DictConfig) -> None:
     global_step = start_epoch * steps_per_epoch
     optimizer.zero_grad(set_to_none=True)
 
-    if start_epoch > 0:
-        logger.info(f"Resuming training from epoch {start_epoch} (global_step={global_step})")
-    logger.info(f"Training for epochs {start_epoch} to {epochs - 1}")
+    training_start_time = time.perf_counter()
 
     for epoch in range(start_epoch, epochs):
         lr = lr_for_epoch(epoch)
@@ -332,8 +409,18 @@ def cmd_train(cfg: DictConfig) -> None:
         n_logged = 0
         epoch_start_time = time.perf_counter()
         images_processed = 0
+        last_log_time = epoch_start_time
+        last_log_images = 0
 
-        pbar = tqdm(loader, total=num_batches, desc=f"epoch {epoch:03d}", unit="batch")
+        # Determine training phase for display
+        if epoch < 5:
+            phase = "A: Stabilize"
+        elif epoch < 35:
+            phase = "B: Bootstrap"
+        else:
+            phase = "C: Refine"
+
+        pbar = tqdm(loader, total=num_batches, desc=f"Epoch {epoch:03d} [{phase}]", unit="batch")
         for step, batch in enumerate(pbar):
             # Handle 2-tuple (no pseudo) or 3-tuple (with pseudo cluster IDs)
             if use_pseudo_pairs and len(batch) == 3:
@@ -413,14 +500,24 @@ def cmd_train(cfg: DictConfig) -> None:
                 metrics_to_log.update(log_gpu_memory())
                 log_wandb(metrics_to_log, step=global_step)
 
-            elapsed = time.perf_counter() - epoch_start_time
-            img_per_sec = images_processed / elapsed if elapsed > 0 else 0
+            # Calculate instantaneous img/s (last ~1 second window)
+            current_time = time.perf_counter()
+            time_since_log = current_time - last_log_time
+            if time_since_log >= 1.0:
+                images_since_log = images_processed - last_log_images
+                img_per_sec = images_since_log / time_since_log
+                last_log_time = current_time
+                last_log_images = images_processed
+            else:
+                # Use average for first second
+                elapsed = current_time - epoch_start_time
+                img_per_sec = images_processed / elapsed if elapsed > 0 else 0
 
             pbar.set_postfix(
                 loss=f"{stats['loss']:.4f}",
                 pos=f"{stats['pos_sim']:.3f}",
                 neg=f"{stats['neg_sim']:.3f}",
-                img_s=f"{img_per_sec:.0f}",
+                ips=f"{img_per_sec:.0f}",
             )
 
         epoch_elapsed = time.perf_counter() - epoch_start_time
@@ -449,11 +546,19 @@ def cmd_train(cfg: DictConfig) -> None:
             if wandb_active:
                 log_wandb(epoch_metrics, step=global_step)
 
+            # Calculate ETA
+            epochs_done = epoch - start_epoch + 1
+            epochs_remaining = epochs - epoch - 1
+            total_elapsed = time.perf_counter() - training_start_time
+            avg_epoch_time = total_elapsed / epochs_done
+            eta_seconds = avg_epoch_time * epochs_remaining
+
             logger.info(
-                f"Epoch {epoch:03d}: loss={epoch_metrics['epoch/loss']:.4f}, "
-                f"pos_sim={epoch_metrics['epoch/pos_sim']:.3f}, "
-                f"neg_sim={epoch_metrics['epoch/neg_sim']:.3f}, "
-                f"img/s={epoch_img_per_sec:.0f}"
+                f"Epoch {epoch:03d} complete | "
+                f"loss={epoch_metrics['epoch/loss']:.4f} | "
+                f"pos={epoch_metrics['epoch/pos_sim']:.3f} neg={epoch_metrics['epoch/neg_sim']:.3f} gap={epoch_metrics['epoch/sim_gap']:.3f} | "
+                f"{epoch_img_per_sec:.0f} img/s | "
+                f"ETA: {_format_time(eta_seconds)}"
             )
 
         if (epoch + 1) % save_every == 0 or (epoch + 1) == epochs:
@@ -467,7 +572,7 @@ def cmd_train(cfg: DictConfig) -> None:
                 pseudo_manager=pseudo_manager,
             )
             prune_checkpoints(out_dir / "checkpoints", keep_last=keep_last)
-            logger.info(f"Saved checkpoint: {ckpt_path}")
+            logger.info(f"Checkpoint saved: {ckpt_path.name}")
 
             if wandb_active and wandb_cfg.get("save_artifacts", False):
                 artifact = wandb.Artifact(
@@ -481,5 +586,12 @@ def cmd_train(cfg: DictConfig) -> None:
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    logger.info("Training complete!")
+    total_training_time = time.perf_counter() - training_start_time
+    logger.info("")
+    logger.info("=" * 70)
+    logger.info(f"  Training complete in {_format_time(total_training_time)}")
+    logger.info(f"  Final epoch: {epochs - 1}")
+    logger.info(f"  Checkpoints: {out_dir / 'checkpoints'}")
+    logger.info("=" * 70)
+    logger.info("")
     finish_wandb()
