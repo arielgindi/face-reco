@@ -1,0 +1,224 @@
+# =============================================================================
+# SniperFace: Label-Free Face Encoder Training (MoCo + MarginNCE)
+# =============================================================================
+# Hydra configuration - all settings can be overridden from command line:
+#   uv run python main.py train.epochs=100 wandb.enabled=false
+# =============================================================================
+
+# Command to run: train, embed, or eval
+command: train
+
+# Hydra settings
+defaults:
+  - _self_
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    subdir: ${hydra.job.num}
+
+# =============================================================================
+# Project & Experiment
+# =============================================================================
+project:
+  name: "SniperFace"
+  description: "Label-free face encoder with MoCo + MarginNCE"
+
+experiment:
+  name: "sniperface_ssl"
+  seed: 42
+  deterministic: false
+
+# =============================================================================
+# Weights & Biases
+# =============================================================================
+wandb:
+  enabled: true
+  project: "sniperface"
+  entity: null  # Your W&B username or team (null = default)
+  name: null    # Run name (null = auto-generated)
+  tags: ["moco", "face-ssl", "iresnet50"]
+  notes: "MoCo v2 + MarginNCE training on synthetic face data"
+  log_every_steps: 50
+  save_artifacts: true  # Save checkpoints as W&B artifacts
+
+# =============================================================================
+# Data Configuration
+# =============================================================================
+# Training automatically excludes test identities (25% by default).
+# The split is identity-disjoint: same person never appears in both sets.
+
+data:
+  digiface_glob: "data/digiface1m_*.parquet"
+  digi2real_glob: "data/digi2real_*.parquet"
+
+  split:
+    train_ratio: 0.75
+    seed: 42
+    cache_dir: ".cache/splits"
+
+  streaming:
+    batch_read_rows: 2048
+    shuffle_buffer_size: 512
+    num_workers: 2
+
+# =============================================================================
+# Model Architecture
+# =============================================================================
+model:
+  backbone:
+    name: "iresnet50"
+    input_size: [112, 112]
+    embedding_dim: 512
+    l2_normalize: true
+    bn_eps: 1.0e-5
+    bn_momentum: 0.1
+
+# =============================================================================
+# Self-Supervised Learning (MoCo v2 + MarginNCE)
+# =============================================================================
+ssl:
+  algorithm: "moco_v2_margin_nce"
+  queue_size: 32768
+  momentum_encoder: 0.999
+  temperature: 0.07
+  margin_nce:
+    enabled: true
+    margin: 0.10
+
+# =============================================================================
+# Training Configuration
+# =============================================================================
+train:
+  epochs: 50
+  samples_per_epoch: 0  # 0 = auto (use dataset size)
+  resume: null  # Path to checkpoint to resume from (e.g., "checkpoints/epoch_015.pt")
+
+  precision:
+    amp: true
+    amp_dtype: "fp16"
+    tf32_matmul: true
+    torch_compile: false  # Enable on native Linux (RunPod), disable on WSL2
+
+  batch:
+    size: 128
+    grad_accum_steps: 2  # Effective batch = 256
+
+  optimizer:
+    name: "sgd"
+    lr: 0.05
+    momentum: 0.9
+    weight_decay: 5.0e-4
+    nesterov: true
+
+  lr_schedule:
+    name: "multistep"
+    warmup:
+      enabled: true
+      epochs: 2
+      start_lr: 0.005
+    milestones: [10, 20, 30, 40]
+    gamma: 0.1
+
+  regularization:
+    grad_clip_norm: 5.0
+
+  checkpointing:
+    save_every_epochs: 1  # Save every epoch for crash recovery
+    keep_last: 0  # 0 = keep all checkpoints
+
+# =============================================================================
+# Curriculum Learning Schedule
+# =============================================================================
+# Controls mixing ratio between synthetic (digiface) and more realistic (digi2real) data
+curriculum:
+  schedule:
+    - start_epoch: 0
+      end_epoch: 15
+      p_digiface: 1.0    # 100% synthetic (geometry foundation)
+    - start_epoch: 16
+      end_epoch: 30
+      p_digiface: 0.5    # 50/50 mix (texture adaptation)
+    - start_epoch: 31
+      end_epoch: 10000
+      p_digiface: 0.3    # 30/70 favoring realistic (realism hardening)
+
+# =============================================================================
+# Augmentations (Two-View for Contrastive Learning)
+# =============================================================================
+augmentation:
+  view_1:
+    random_resized_crop:
+      scale: [0.20, 1.00]
+      ratio: [0.75, 1.33]
+    horizontal_flip_p: 0.5
+    randaugment:
+      num_ops: 4
+      magnitude: 16
+    color_jitter:
+      p: 0.8
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.4
+      hue: 0.1
+    grayscale_p: 0.2
+    gaussian_blur:
+      p: 0.5
+      sigma: [0.1, 2.0]
+    jpeg_compression:
+      p: 0.3
+      quality: [30, 95]
+    iso_noise:
+      p: 0.2
+      sigma: [0.0, 0.08]
+    cutout:
+      p: 0.2
+      holes: 1
+      size_ratio: [0.10, 0.30]
+
+  view_2:
+    random_resized_crop:
+      scale: [0.20, 1.00]
+      ratio: [0.75, 1.33]
+    horizontal_flip_p: 0.5
+    randaugment:
+      num_ops: 4
+      magnitude: 16
+    color_jitter:
+      p: 0.8
+      brightness: 0.4
+      contrast: 0.4
+      saturation: 0.4
+      hue: 0.1
+    grayscale_p: 0.2
+    gaussian_blur:
+      p: 0.2
+      sigma: [0.1, 2.0]
+    jpeg_compression:
+      p: 0.3
+      quality: [30, 95]
+    iso_noise:
+      p: 0.2
+      sigma: [0.0, 0.08]
+    cutout:
+      p: 0.2
+      holes: 1
+      size_ratio: [0.10, 0.30]
+
+# =============================================================================
+# Embedding Export (for evaluation)
+# =============================================================================
+embed:
+  split: "test"  # Which split to embed: "train" or "test"
+  batch_size: 256
+  amp: true
+
+# =============================================================================
+# Evaluation Metrics
+# =============================================================================
+eval:
+  enroll_per_id: 5
+  top_k: 5
+  query_batch: 50000
