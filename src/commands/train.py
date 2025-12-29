@@ -32,7 +32,6 @@ from src.schedule import (
     curriculum_p_digiface,
     get_pseudo_prob,
     get_refresh_epochs,
-    get_sim_threshold,
 )
 from src.utils import compute_epoch_batch_counts, configure_precision, select_device, set_seed
 from src.wandb_utils import finish_wandb, init_wandb, log_gpu_memory, log_wandb
@@ -138,10 +137,21 @@ def cmd_train(cfg: DictConfig) -> None:
     # Pseudo-ID manager
     pseudo_cfg = cfg.get("pseudo", {})
     pseudo_enabled = bool(pseudo_cfg.get("enabled", False))
-    pseudo_mgr = PseudoIDManager(
-        knn_k=int(pseudo_cfg.get("knn_k", 20)), mutual_topk=int(pseudo_cfg.get("mutual_topk", 5)),
-        min_cluster_size=int(pseudo_cfg.get("min_cluster_size", 2)), max_cluster_size=int(pseudo_cfg.get("max_cluster_size", 50)),
-    ) if pseudo_enabled else None
+    if pseudo_enabled:
+        threshold_cfg = pseudo_cfg.sim_threshold
+        pseudo_mgr = PseudoIDManager(
+            knn_k=int(pseudo_cfg.knn_k),
+            mutual_topk=int(pseudo_cfg.mutual_topk),
+            min_cluster_size=int(pseudo_cfg.min_cluster_size),
+            max_cluster_size=int(pseudo_cfg.max_cluster_size),
+            threshold_start=float(threshold_cfg.start),
+            threshold_end=float(threshold_cfg.end),
+            target_coverage=float(threshold_cfg.target_coverage),
+            adaptation_rate=float(threshold_cfg.adaptation_rate),
+            adaptive_mode=str(threshold_cfg.mode).lower() == "adaptive",
+        )
+    else:
+        pseudo_mgr = None
 
     # Resume checkpoint
     start_epoch = 0
@@ -206,7 +216,7 @@ def cmd_train(cfg: DictConfig) -> None:
         # Pseudo-ID refresh
         if pseudo_mgr and epoch in refresh_epochs:
             datasets = [digiface_ds] + ([digi2real_ds] if digi2real_ds else [])
-            stats = pseudo_mgr.refresh(model, datasets, epoch, get_sim_threshold(epoch, cfg), device, batch_size, num_workers)
+            stats = pseudo_mgr.refresh(model, datasets, epoch, pseudo_mgr.get_threshold(), device, batch_size, num_workers)
             if wandb_active:
                 log_wandb(stats, step=global_step)
             if reset_queue:
