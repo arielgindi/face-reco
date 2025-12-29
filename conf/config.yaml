@@ -38,7 +38,7 @@ wandb:
   entity: null
   name: "pseudo-id-bootstrap-75ep"
   tags: ["moco", "pseudo-id", "mutual-knn", "iresnet50", "phase2"]
-  notes: "Mutual-kNN pseudo-ID bootstrapping from epoch_039 checkpoint. Threshold 0.72→0.52, temp=0.05, margin=0.15"
+  notes: "Mutual-kNN pseudo-ID bootstrapping from epoch_039 checkpoint. Threshold 0.72->0.52, temp=0.05, margin=0.15"
   log_every_steps: 50
   save_artifacts: true
 
