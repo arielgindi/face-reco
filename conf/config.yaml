@@ -2,7 +2,7 @@
 # SniperFace: Label-Free Face Encoder Training (MoCo + MarginNCE)
 # =============================================================================
 # Hydra configuration - all settings can be overridden from command line:
-#   uv run python sniperface.py train.epochs=100 wandb.enabled=false
+#   uv run python main.py train.epochs=100 wandb.enabled=false
 # =============================================================================
 
 # Command to run: train, embed, or eval
