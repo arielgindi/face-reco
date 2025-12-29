@@ -16,6 +16,14 @@ hydra:
   sweep:
     dir: multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
     subdir: ${hydra.job.num}
+  job_logging:
+    formatters:
+      simple:
+        format: "[%(asctime)s] %(message)s"
+        datefmt: "%H:%M:%S"
+    handlers:
+      console:
+        formatter: simple
 
 # =============================================================================
 # Project & Experiment
@@ -38,7 +46,7 @@ wandb:
   entity: null
   name: "pseudo-id-bootstrap-75ep"
   tags: ["moco", "pseudo-id", "mutual-knn", "iresnet50", "phase2"]
-  notes: "Mutual-kNN pseudo-ID bootstrapping from epoch_039 checkpoint. Threshold 0.72->0.52, temp=0.05, margin=0.15"
+  notes: "Mutual-kNN pseudo-ID with adaptive threshold (0.68->0.48, 40% coverage target). gamma=0.5, min_aug=0.15"
   log_every_steps: 50
   save_artifacts: true
 
@@ -98,11 +106,13 @@ pseudo:
   knn_k: 20                   # Search k neighbors per image
   mutual_topk: 5              # Edge kept only if mutual top-5
 
-  # Similarity threshold schedule (CRITICAL: must start above inter-ID sim of 0.62)
+  # Similarity threshold with coverage-driven adaptation
   sim_threshold:
-    start: 0.72               # High precision start (above 0.62 baseline)
-    end: 0.52                 # Relax as model improves
-    decay_end_epoch: 50       # Linear decay over 50 epochs
+    mode: "adaptive"          # "adaptive" or "fixed"
+    start: 0.68               # Starting threshold (lowered from 0.72)
+    end: 0.48                 # Minimum threshold floor
+    target_coverage: 0.40     # Target 40% of images clustered
+    adaptation_rate: 0.02     # Threshold adjustment per refresh cycle
 
   # Cluster size bounds
   min_cluster_size: 2         # Need 2+ images for cross-image pairs
@@ -117,7 +127,7 @@ pseudo:
   # Positive Pair Mixing Schedule
   # -------------------------------------------------------------------------
   pos_mix:
-    min_same_image_prob: 0.10   # Always keep 10% aug-pairs for stability
+    min_same_image_prob: 0.15   # Always keep 15% aug-pairs for stability
     schedule:
       - start_epoch: 0
         end_epoch: 4
@@ -179,7 +189,7 @@ train:
       epochs: 2
       start_lr: 0.002
     milestones: [20, 40, 60]  # Decay at phase transitions
-    gamma: 0.2                # Gentler than 0.1
+    gamma: 0.5                # Keep LR meaningful late in training
 
   regularization:
     grad_clip_norm: 5.0

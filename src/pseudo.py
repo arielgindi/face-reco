@@ -90,13 +90,27 @@ class PseudoIDState:
 
 @dataclass
 class PseudoIDManager:
-    """Manages pseudo-ID mining via mutual k-NN graph construction."""
-    knn_k: int = 20
-    mutual_topk: int = 5
-    min_cluster_size: int = 2
-    max_cluster_size: int = 50
-    state: PseudoIDState | None = None
-    _image_bytes_cache: dict[int, bytes] = field(default_factory=dict)
+    """Manages pseudo-ID mining via mutual k-NN graph construction.
+
+    All parameters are required - no defaults. Config is the single source of truth.
+    """
+    knn_k: int
+    mutual_topk: int
+    min_cluster_size: int
+    max_cluster_size: int
+    threshold_start: float
+    threshold_end: float
+    target_coverage: float
+    adaptation_rate: float
+    adaptive_mode: bool
+    # State (initialized at runtime)
+    state: PseudoIDState | None = field(default=None, init=False)
+    current_threshold: float = field(default=0.0, init=False)
+    _image_bytes_cache: dict[int, bytes] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        """Initialize current threshold to start value."""
+        self.current_threshold = self.threshold_start
 
     @property
     def num_clusters(self) -> int:
@@ -110,6 +124,32 @@ class PseudoIDManager:
         """Clear all pseudo-ID state and cached images."""
         self.state = None
         self._image_bytes_cache.clear()
+        self.current_threshold = self.threshold_start
+
+    def get_threshold(self) -> float:
+        """Get current similarity threshold for pseudo-ID mining."""
+        return self.current_threshold
+
+    def adapt_threshold(self, coverage: float) -> None:
+        """Adapt threshold based on coverage (called after each refresh).
+
+        If coverage < target: lower threshold to include more pairs
+        If coverage > target: raise threshold for higher precision
+        """
+        if not self.adaptive_mode:
+            return
+
+        if coverage < self.target_coverage:
+            # Under target: lower threshold to get more clusters
+            new_threshold = self.current_threshold - self.adaptation_rate
+        else:
+            # At or above target: raise threshold for precision
+            new_threshold = self.current_threshold + self.adaptation_rate * 0.5
+
+        # Clamp to [end, start] range
+        self.current_threshold = max(self.threshold_end, min(self.threshold_start, new_threshold))
+        logger.info(f"  -> Adaptive threshold: {self.current_threshold:.3f} "
+                    f"(coverage={coverage:.1%}, target={self.target_coverage:.1%})")
 
     def refresh(self, model: MoCo, datasets: list[ParquetTwoViewDataset], epoch: int,
                 sim_threshold: float, device: torch.device, batch_size: int = 256,
@@ -149,6 +189,9 @@ class PseudoIDManager:
 
         logger.info(f"  -> {len(cluster_to_images):,} clusters, {num_clustered:,} images "
                     f"({accept_rate:.1%}), avg={avg_cluster_size:.1f}, {elapsed:.1f}s")
+
+        # Adapt threshold for next refresh based on coverage
+        self.adapt_threshold(accept_rate)
 
         return {
             "pseudo/cluster_count": len(cluster_to_images),
