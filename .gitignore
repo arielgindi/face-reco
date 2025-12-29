@@ -88,6 +88,9 @@ train_log.jsonl
 .DS_Store
 Thumbs.db
 
+# Claude Code
+.claude/
+
 # Secrets
 .env
 *.key
