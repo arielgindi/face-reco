@@ -26,7 +26,15 @@ from src.checkpoint import (
     save_checkpoint,
 )
 from src.model import build_moco
-from src.schedule import build_curriculum_schedule, curriculum_p_digiface
+from src.pseudo import PseudoIDManager
+from src.schedule import (
+    build_curriculum_schedule,
+    build_pseudo_schedule,
+    curriculum_p_digiface,
+    get_pseudo_prob,
+    get_refresh_epochs,
+    get_sim_threshold,
+)
 from src.utils import (
     compute_epoch_batch_counts,
     configure_precision,
@@ -115,7 +123,25 @@ def cmd_train(cfg: DictConfig) -> None:
     if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16:
         scaler = torch.amp.GradScaler("cuda")
 
+    # Initialize pseudo-ID manager if enabled
+    pseudo_cfg = cfg.get("pseudo", {})
+    pseudo_enabled = bool(pseudo_cfg.get("enabled", False))
+    pseudo_manager: PseudoIDManager | None = None
+
+    if pseudo_enabled:
+        pseudo_manager = PseudoIDManager(
+            knn_k=int(pseudo_cfg.get("knn_k", 20)),
+            mutual_topk=int(pseudo_cfg.get("mutual_topk", 5)),
+            min_cluster_size=int(pseudo_cfg.get("min_cluster_size", 2)),
+            max_cluster_size=int(pseudo_cfg.get("max_cluster_size", 50)),
+        )
+        logger.info(
+            f"Pseudo-ID mining enabled: knn_k={pseudo_manager.knn_k}, "
+            f"mutual_topk={pseudo_manager.mutual_topk}"
+        )
+
     resume_path = cfg.train.get("resume")
+    warm_start = bool(cfg.train.get("warm_start", False))
     start_epoch = 0
     if resume_path:
         start_epoch = load_checkpoint_for_resume(
@@ -124,6 +150,8 @@ def cmd_train(cfg: DictConfig) -> None:
             optimizer=optimizer,
             scaler=scaler,
             device=device,
+            pseudo_manager=pseudo_manager,
+            warm_start=warm_start,
         )
 
     use_torch_compile = bool(cfg.train.precision.get("torch_compile", False))
@@ -209,6 +237,14 @@ def cmd_train(cfg: DictConfig) -> None:
         prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
 
     schedule = build_curriculum_schedule(cfg)
+    pseudo_schedule = build_pseudo_schedule(cfg) if pseudo_enabled else ()
+    refresh_epochs = get_refresh_epochs(cfg)
+
+    # Pseudo-ID negative masking config
+    neg_cfg = pseudo_cfg.get("negatives", {}) if pseudo_enabled else {}
+    mask_same_cluster = bool(neg_cfg.get("mask_same_pseudo_in_queue", True))
+    mask_topk = int(neg_cfg.get("mask_topk_most_similar", 8))
+    reset_queue_on_refresh = bool(neg_cfg.get("reset_queue_on_refresh", True))
 
     steps_per_epoch = num_batches // grad_accum
     global_step = start_epoch * steps_per_epoch
@@ -224,14 +260,58 @@ def cmd_train(cfg: DictConfig) -> None:
             pg["lr"] = lr
 
         p_digiface = curriculum_p_digiface(epoch, schedule)
+        pseudo_prob = get_pseudo_prob(epoch, pseudo_schedule) if pseudo_enabled else 0.0
 
-        epoch_ds = data.CurriculumMixTwoViewDataset(
+        # Check if we need to refresh pseudo-IDs at start of this epoch
+        if pseudo_enabled and pseudo_manager is not None and epoch in refresh_epochs:
+            sim_threshold = get_sim_threshold(epoch, cfg)
+            datasets_for_mining = [digiface_ds]
+            if digi2real_ds is not None:
+                datasets_for_mining.append(digi2real_ds)
+
+            refresh_stats = pseudo_manager.refresh(
+                model=model,
+                datasets=datasets_for_mining,
+                epoch=epoch,
+                sim_threshold=sim_threshold,
+                device=device,
+                batch_size=batch_size,
+                num_workers=num_workers,
+            )
+
+            # Log refresh stats to W&B
+            if wandb_active:
+                log_wandb(refresh_stats, step=global_step)
+
+            # Reset queue after refresh
+            if reset_queue_on_refresh:
+                model.reset_queue()
+                logger.info("Queue reset after pseudo-ID refresh")
+
+        # Build curriculum dataset
+        curriculum_ds = data.CurriculumMixTwoViewDataset(
             digiface=digiface_ds,
             digi2real=digi2real_ds,
             p_digiface=p_digiface,
             num_samples=num_samples,
             seed=seed + epoch * 17,
         )
+
+        # Wrap with pseudo-pair sampling if enabled and have clusters
+        if pseudo_enabled and pseudo_manager is not None and pseudo_manager.state is not None:
+            epoch_ds: Any = data.PseudoPairTwoViewDataset(
+                base_dataset=curriculum_ds,
+                pseudo_manager=pseudo_manager,  # FIX: Pass manager, not state
+                transform_q=t_q,
+                transform_k=t_k,
+                p_pseudo=pseudo_prob,
+                num_samples=num_samples,
+                seed=seed + epoch * 17,
+            )
+            use_pseudo_pairs = True
+        else:
+            epoch_ds = curriculum_ds
+            use_pseudo_pairs = False
 
         loader_kwargs: dict[str, Any] = {
             "batch_size": batch_size,
@@ -254,7 +334,16 @@ def cmd_train(cfg: DictConfig) -> None:
         images_processed = 0
 
         pbar = tqdm(loader, total=num_batches, desc=f"epoch {epoch:03d}", unit="batch")
-        for step, (im_q, im_k) in enumerate(pbar):
+        for step, batch in enumerate(pbar):
+            # Handle 2-tuple (no pseudo) or 3-tuple (with pseudo cluster IDs)
+            if use_pseudo_pairs and len(batch) == 3:
+                im_q, im_k, cluster_ids = batch
+                # FIX: Cast to int32 to match queue_cluster_ids dtype
+                cluster_ids = cluster_ids.to(dtype=torch.int32, device=device, non_blocking=True)
+            else:
+                im_q, im_k = batch[0], batch[1]
+                cluster_ids = None
+
             images_processed += im_q.shape[0]
             im_q = im_q.to(device, non_blocking=True)
             im_k = im_k.to(device, non_blocking=True)
@@ -264,7 +353,13 @@ def cmd_train(cfg: DictConfig) -> None:
                 enabled=amp_enabled and device.type == "cuda",
                 dtype=amp_dtype,
             ):
-                loss, stats = model(im_q, im_k)
+                loss, stats = model(
+                    im_q,
+                    im_k,
+                    cluster_ids=cluster_ids,
+                    mask_same_cluster=mask_same_cluster and use_pseudo_pairs,
+                    mask_topk=mask_topk if use_pseudo_pairs else 0,
+                )
                 loss_to_backprop = loss / float(grad_accum)
 
             if scaler is not None:
@@ -311,6 +406,10 @@ def cmd_train(cfg: DictConfig) -> None:
                     "train/p_digiface": p_digiface,
                     "train/epoch": epoch,
                 }
+                # Add pseudo-ID metrics if enabled
+                if pseudo_enabled:
+                    metrics_to_log["train/pseudo_prob"] = pseudo_prob
+                    metrics_to_log["train/neg_masked_pct"] = stats.get("neg_masked_pct", 0.0)
                 metrics_to_log.update(log_gpu_memory())
                 log_wandb(metrics_to_log, step=global_step)
 
@@ -341,6 +440,11 @@ def cmd_train(cfg: DictConfig) -> None:
                 "epoch/p_digiface": p_digiface,
                 "epoch/number": epoch,
             }
+            # Add pseudo-ID epoch metrics
+            if pseudo_enabled:
+                epoch_metrics["epoch/pseudo_prob"] = pseudo_prob
+                if pseudo_manager is not None and pseudo_manager.state is not None:
+                    epoch_metrics["epoch/pseudo_clusters"] = pseudo_manager.num_clusters
             epoch_metrics.update(log_gpu_memory())
             if wandb_active:
                 log_wandb(epoch_metrics, step=global_step)
@@ -360,6 +464,7 @@ def cmd_train(cfg: DictConfig) -> None:
                 optimizer=optimizer,
                 scaler=scaler,
                 cfg=cfg,
+                pseudo_manager=pseudo_manager,
             )
             prune_checkpoints(out_dir / "checkpoints", keep_last=keep_last)
             logger.info(f"Saved checkpoint: {ckpt_path}")

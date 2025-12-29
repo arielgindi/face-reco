@@ -103,8 +103,24 @@ class MoCo(nn.Module):
         self.register_buffer("queue", queue)
         self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
 
+        # Pseudo-ID tracking for negative masking
+        # -1 means "no cluster assigned" (treat as normal negative)
+        self.register_buffer(
+            "queue_cluster_ids",
+            torch.full((cfg.queue_size,), -1, dtype=torch.int32),
+        )
+
         if device is not None:
             self.to(device)
+
+    @torch.no_grad()
+    def reset_queue(self) -> None:
+        """Reset queue to random embeddings (call after pseudo-ID refresh)."""
+        queue = torch.randn_like(self.queue)
+        queue = l2_normalize(queue, dim=0)
+        self.queue.copy_(queue)
+        self.queue_ptr.zero_()
+        self.queue_cluster_ids.fill_(-1)
 
     def _copy_params_q_to_k(self) -> None:
         """Initialize momentum encoder to match the query encoder."""
@@ -143,22 +159,35 @@ class MoCo(nn.Module):
             param_k.data.mul_(m).add_(param_q.data, alpha=1.0 - m)
 
     @torch.no_grad()
-    def _dequeue_and_enqueue(self, keys: torch.Tensor) -> None:
+    def _dequeue_and_enqueue(
+        self,
+        keys: torch.Tensor,
+        cluster_ids: torch.Tensor | None = None,
+    ) -> None:
         """Update queue with the latest batch of key projections."""
         keys = keys.detach()
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr.item())
         k = self.cfg.queue_size
 
+        # Default cluster IDs to -1 if not provided
+        if cluster_ids is None:
+            cluster_ids = torch.full(
+                (batch_size,), -1, dtype=torch.int32, device=keys.device
+            )
+
         # Handle wraparound
         if ptr + batch_size > k:
             space_left = k - ptr
             self.queue[:, ptr:k] = keys[:space_left].T
+            self.queue_cluster_ids[ptr:k] = cluster_ids[:space_left]
             remaining = batch_size - space_left
             self.queue[:, :remaining] = keys[space_left:].T
+            self.queue_cluster_ids[:remaining] = cluster_ids[space_left:]
             ptr = remaining
         else:
             self.queue[:, ptr : ptr + batch_size] = keys.T
+            self.queue_cluster_ids[ptr : ptr + batch_size] = cluster_ids
             ptr = (ptr + batch_size) % k
 
         self.queue_ptr[0] = ptr
@@ -174,8 +203,19 @@ class MoCo(nn.Module):
         self,
         im_q: torch.Tensor,
         im_k: torch.Tensor,
+        cluster_ids: torch.Tensor | None = None,
+        mask_same_cluster: bool = False,
+        mask_topk: int = 0,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Compute MarginNCE loss for a batch."""
+        """Compute MarginNCE loss for a batch.
+
+        Args:
+            im_q: Query images (B, C, H, W)
+            im_k: Key images (B, C, H, W)
+            cluster_ids: Optional pseudo-cluster IDs for this batch (B,)
+            mask_same_cluster: If True, mask queue negatives with same cluster ID
+            mask_topk: Additionally mask top-k most similar negatives (likely false negatives)
+        """
         # Query embeddings
         emb_q = self.backbone_q(im_q)
         if self.cfg.l2_normalize_backbone:
@@ -197,6 +237,32 @@ class MoCo(nn.Module):
         # Negative logits: NxK
         l_neg = torch.einsum("nc,ck->nk", q, self.queue.clone().detach())
 
+        # ===== NEGATIVE MASKING =====
+        neg_masked_count = 0
+        if (mask_same_cluster or mask_topk > 0) and cluster_ids is not None:
+            mask = torch.zeros_like(l_neg, dtype=torch.bool)
+
+            # Mask 1: Same pseudo-cluster in queue
+            if mask_same_cluster:
+                # Only mask where both query and queue have valid cluster IDs (>= 0)
+                valid_query = cluster_ids >= 0  # (B,)
+                valid_queue = self.queue_cluster_ids >= 0  # (K,)
+
+                # (B, 1) == (1, K) -> (B, K)
+                same_cluster = cluster_ids.unsqueeze(1) == self.queue_cluster_ids.unsqueeze(0)
+                # Only apply where both are valid
+                same_cluster = same_cluster & valid_query.unsqueeze(1) & valid_queue.unsqueeze(0)
+                mask = mask | same_cluster
+
+            # Mask 2: Top-k most similar (likely false negatives beyond cluster)
+            if mask_topk > 0:
+                _, topk_indices = l_neg.topk(mask_topk, dim=1)  # (B, mask_topk)
+                mask.scatter_(1, topk_indices, True)
+
+            # Apply mask by setting to large negative (excluded from softmax)
+            neg_masked_count = int(mask.sum().item())
+            l_neg = l_neg.masked_fill(mask, float("-inf"))
+
         # Apply margin to positive logits (MarginNCE)
         if self.cfg.margin > 0:
             l_pos = l_pos - self.cfg.margin
@@ -209,16 +275,19 @@ class MoCo(nn.Module):
         labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
         loss = F.cross_entropy(logits, labels)
 
-        # Update queue
-        self._dequeue_and_enqueue(k)
+        # Update queue with cluster IDs
+        self._dequeue_and_enqueue(k, cluster_ids)
 
         # Collect stats for logging
+        batch_size = im_q.shape[0]
+        queue_size = self.cfg.queue_size
         stats: dict[str, Any] = {
             "loss": float(loss.detach().cpu()),
             "pos_sim": float((l_pos + self.cfg.margin).mean().detach().cpu()),
-            "neg_sim": float(l_neg.mean().detach().cpu()),
+            "neg_sim": float(l_neg[l_neg > float("-inf")].mean().detach().cpu()) if neg_masked_count < batch_size * queue_size else 0.0,
             "queue_ptr": int(self.queue_ptr.item()),
             "emb_std": float(emb_q.detach().std(dim=0).mean().cpu()),
+            "neg_masked_pct": neg_masked_count / (batch_size * queue_size) if queue_size > 0 else 0.0,
         }
         return loss, stats
 
