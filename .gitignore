@@ -62,7 +62,7 @@ multirun/
 wandb/
 
 # Data (large files)
-data/
+/data/
 
 # Model checkpoints
 checkpoints/
