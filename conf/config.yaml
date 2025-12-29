@@ -34,7 +34,7 @@ experiment:
 # =============================================================================
 wandb:
   enabled: true
-  project: "sniperface"
+  project: "sniperface-v2"
   entity: null
   name: "pseudo-id-bootstrap-75ep"
   tags: ["moco", "pseudo-id", "mutual-knn", "iresnet50", "phase2"]
