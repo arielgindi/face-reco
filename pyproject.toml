@@ -20,10 +20,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# For 4070 Ti, 4090, etc. (sm_89 and below)
+# For 4070 Ti, 4090, A100, H100 (sm_89 and below)
 cu124 = ["torch", "torchvision"]
-# For Blackwell GPUs - RTX 5090, PRO 6000, etc. (sm_120)
+# For Blackwell GPUs - RTX 5090, PRO 6000 (sm_120)
 cu128 = ["torch", "torchvision"]
+
+[tool.uv]
+# Tell uv these extras are mutually exclusive
+conflicts = [
+  [{ extra = "cu124" }, { extra = "cu128" }]
+]
 
 # PyTorch CUDA 12.4 (4070 Ti, 4090, A100, H100)
 [[tool.uv.index]]
