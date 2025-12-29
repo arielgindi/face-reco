@@ -339,11 +339,6 @@ def build_moco(cfg: Mapping[str, Any], device: torch.device | None = None) -> Mo
         l2_normalize_backbone=bool(backbone_cfg.get("l2_normalize", True)),
     )
 
-    logger.info(
-        f"Building MoCo: queue_size={moco_cfg.queue_size}, "
-        f"margin={moco_cfg.margin}, temp={moco_cfg.temperature}"
-    )
-
     return MoCo(backbone=backbone, cfg=moco_cfg, device=device)
 
 

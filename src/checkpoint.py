@@ -41,8 +41,8 @@ def load_checkpoint_for_resume(
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
 
-    logger.info(f"Resuming from checkpoint: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt_epoch = int(ckpt.get("epoch", 0))
 
     # For warm start, filter out queue buffers (they may have different sizes)
     ckpt_state = ckpt["model"]
@@ -53,43 +53,28 @@ def load_checkpoint_for_resume(
             k: v for k, v in ckpt_state.items()
             if not k.startswith(skip_prefixes)
         }
-        logger.info("Warm start: skipping queue buffers from checkpoint")
 
     # Load model with strict=False to handle new/missing buffers
-    missing, unexpected = model.load_state_dict(ckpt_state, strict=False)
-    if missing:
-        logger.info(f"Missing keys (will use defaults): {missing}")
-    if unexpected:
-        logger.warning(f"Unexpected keys in checkpoint: {unexpected}")
-    logger.info("Loaded model state")
+    model.load_state_dict(ckpt_state, strict=False)
 
     if not warm_start:
         optimizer.load_state_dict(ckpt["optimizer"])
-        logger.info("Loaded optimizer state")
-
         if scaler is not None and "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
-            logger.info("Loaded AMP scaler state")
 
-        # Load pseudo-ID state if available and not warm starting
+        # Load pseudo-ID state if available
         if pseudo_manager is not None and "pseudo" in ckpt:
             from src.pseudo import PseudoIDState
+            pseudo_manager.state = PseudoIDState.from_dict(ckpt["pseudo"])
 
-            pseudo_data = ckpt["pseudo"]
-            pseudo_manager.state = PseudoIDState.from_dict(pseudo_data)
-            logger.info(
-                f"Loaded pseudo-ID state: {pseudo_manager.num_clusters} clusters, "
-                f"last refresh at epoch {pseudo_manager.last_refresh_epoch}"
-            )
-
-        start_epoch = int(ckpt["epoch"])
-        logger.info(f"Resuming from epoch {start_epoch}")
+        start_epoch = ckpt_epoch
+        logger.info(f"Resumed from {path.name} at epoch {start_epoch}")
     else:
         # Warm start: reset epoch, don't load optimizer/scaler/pseudo
         start_epoch = 0
         if pseudo_manager is not None:
             pseudo_manager.clear()
-        logger.info("Warm start: epoch reset to 0, optimizer/pseudo state cleared")
+        logger.info(f"Warm start from {path.name} (checkpoint epoch {ckpt_epoch})")
 
     return start_epoch
 
