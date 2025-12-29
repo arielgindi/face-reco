@@ -52,15 +52,22 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
                 f"Run: python fast_convert.py"
             )
 
-        # Load FULL array into RAM (main process)
-        # Workers inherit via fork() COW - zero memory duplication
+        # Load array - use mmap on Windows (spawn), direct load on Unix (fork COW)
+        import sys
         logger.info(f"Loading binary cache: {self.npy_path}")
-        self.images: np.ndarray = np.load(str(self.npy_path))
+        if sys.platform == "win32":
+            # Windows uses spawn - each worker would reload entire array
+            # Use memory-mapping for true zero-copy shared access
+            self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode='r')
+        else:
+            # Unix fork() gives COW - load once, workers share via page tables
+            self.images = np.load(str(self.npy_path))
 
         if self.images.ndim != 4 or self.images.shape[3] != 3:
             raise ValueError(f"Expected (N, H, W, 3), got {self.images.shape}")
 
-        if not self.images.flags['C_CONTIGUOUS']:
+        # Skip contiguity check for mmap (read-only, handled by OS)
+        if sys.platform != "win32" and not self.images.flags['C_CONTIGUOUS']:
             logger.warning("Making array contiguous...")
             self.images = np.ascontiguousarray(self.images)
 
