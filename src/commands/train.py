@@ -169,10 +169,14 @@ def cmd_train(cfg: DictConfig) -> None:
             pseudo_manager=pseudo_mgr, warm_start=bool(cfg.train.get("warm_start", False)),
         )
 
-    # Torch compile (Linux only)
+    # Torch compile (Linux only, skip Blackwell - Triton doesn't fully support sm_120 yet)
     if device.type == "cuda" and sys.platform != "win32" and cfg.train.precision.get("torch_compile"):
-        torch._dynamo.config.capture_scalar_outputs = True
-        model = torch.compile(model, mode="reduce-overhead")
+        cc = torch.cuda.get_device_capability(0)
+        if cc[0] >= 12:  # Blackwell is sm_120 (12.0)
+            logger.warning(f"Skipping torch.compile: Blackwell GPU (sm_{cc[0]}{cc[1]}) not fully supported by Triton")
+        else:
+            torch._dynamo.config.capture_scalar_outputs = True
+            model = torch.compile(model, mode="reduce-overhead")
 
     # Datasets
     input_size = tuple(cfg.model.backbone.input_size)
