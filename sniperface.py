@@ -942,19 +942,27 @@ def cmd_embed(cfg: DictConfig) -> None:
     split_cfg = data_cfg.get("split", {})
 
     digiface_glob = data_cfg.get("digiface_glob")
+    digi2real_glob = data_cfg.get("digi2real_glob")
     if not digiface_glob:
         digiface_glob = ckpt_cfg.get("data", {}).get("digiface_glob")
+    if not digi2real_glob:
+        digi2real_glob = ckpt_cfg.get("data", {}).get("digi2real_glob")
 
     if not digiface_glob:
         raise ValueError("No data glob found in config or checkpoint.")
 
-    # Get splits
+    # Get splits - USE BOTH GLOBS like training does!
     cache_dir = Path(split_cfg.get("cache_dir", ".cache/splits"))
     train_ratio = float(split_cfg.get("train_ratio", 0.75))
     split_seed = int(split_cfg.get("seed", cfg.get("experiment", {}).get("seed", 42)))
 
+    # Build glob list the same way as training
+    data_globs = [digiface_glob]
+    if digi2real_glob:
+        data_globs.append(digi2real_glob)
+
     splits_path = dataio.get_or_create_splits(
-        globs=[digiface_glob],
+        globs=data_globs,
         cache_dir=cache_dir,
         train_ratio=train_ratio,
         seed=split_seed,
@@ -985,9 +993,12 @@ def cmd_embed(cfg: DictConfig) -> None:
         [
             ("identity_id", pa.string()),
             ("image_filename", pa.string()),
-            ("embedding", pa.fixed_size_list(pa.float32(), emb_dim)),
+            ("embedding", pa.list_(pa.float32(), emb_dim)),
         ]
     )
+    # Store checkpoint info in metadata
+    metadata = {"checkpoint": str(ckpt_path.name)}
+    schema = schema.with_metadata(metadata)
     writer = pq.ParquetWriter(out_path, schema=schema, compression="zstd")
 
     amp_enabled = bool(embed_cfg.get("amp", True)) and device.type == "cuda"
@@ -1037,6 +1048,11 @@ def cmd_eval(cfg: DictConfig) -> None:
 
     parquet_file = pq.ParquetFile(emb_path)
     schema = parquet_file.schema_arrow
+
+    # Log which checkpoint was used for embeddings
+    if schema.metadata:
+        ckpt_name = schema.metadata.get(b"checkpoint", b"unknown").decode()
+        logger.info(f"Embeddings from checkpoint: {ckpt_name}")
 
     emb_field = schema.field("embedding")
     dim = int(emb_field.type.list_size)
