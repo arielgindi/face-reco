@@ -158,19 +158,33 @@ class PseudoIDManager:
                 num_workers: int = 2) -> dict[str, Any]:
         """Run pseudo-ID mining: embed -> kNN -> mutual filter -> cluster."""
         start_time = time.perf_counter()
+        logger.info(f"Pseudo-ID mining (epoch {epoch}, threshold={sim_threshold:.2f})...")
 
         # Step 1: Embed all training images
-        logger.info(f"Pseudo-ID mining (epoch {epoch}, threshold={sim_threshold:.2f})...")
+        logger.info("  [1/4] Embedding all images...")
+        t0 = time.perf_counter()
         embeddings, image_bytes_list = self._embed_all(model, datasets, device, batch_size, num_workers)
         num_images = len(embeddings)
+        logger.info(f"  [1/4] Embedded {num_images:,} images in {time.perf_counter() - t0:.1f}s")
 
-        # Step 2: Build kNN graph and filter to mutual edges
+        # Step 2: Build kNN graph
+        logger.info(f"  [2/4] Building k-NN graph (k={self.knn_k})...")
+        t0 = time.perf_counter()
         knn_similarities, knn_indices = self._build_knn_graph(embeddings)
-        mutual_edges = self._filter_to_mutual_edges(knn_indices, knn_similarities, sim_threshold)
+        logger.info(f"  [2/4] Built k-NN graph in {time.perf_counter() - t0:.1f}s")
 
-        # Step 3: Find connected components and filter by size
+        # Step 3: Filter to mutual edges
+        logger.info(f"  [3/4] Filtering to mutual edges (threshold={sim_threshold:.2f})...")
+        t0 = time.perf_counter()
+        mutual_edges = self._filter_to_mutual_edges(knn_indices, knn_similarities, sim_threshold)
+        logger.info(f"  [3/4] Found {len(mutual_edges):,} mutual edges in {time.perf_counter() - t0:.1f}s")
+
+        # Step 4: Find connected components and filter by size
+        logger.info("  [4/4] Finding clusters...")
+        t0 = time.perf_counter()
         cluster_labels = self._find_connected_components(mutual_edges, num_images)
         cluster_labels, cluster_to_images = self._filter_clusters_by_size(cluster_labels)
+        logger.info(f"  [4/4] Clustered in {time.perf_counter() - t0:.1f}s")
 
         # Build state
         num_clustered = int((cluster_labels >= 0).sum())
@@ -212,14 +226,20 @@ class PseudoIDManager:
         model.eval()
         all_embeddings, all_image_bytes = [], []
 
-        for dataset in datasets:
-            loader = DataLoader(_SimpleImageDataset(dataset), batch_size=batch_size,
+        for ds_idx, dataset in enumerate(datasets):
+            simple_ds = _SimpleImageDataset(dataset)
+            total_batches = (len(simple_ds) + batch_size - 1) // batch_size
+            loader = DataLoader(simple_ds, batch_size=batch_size,
                                 num_workers=num_workers, pin_memory=device.type == "cuda")
             with torch.no_grad():
-                for images, image_bytes_batch in loader:
+                for batch_idx, (images, image_bytes_batch) in enumerate(loader):
                     embeddings = l2_normalize(model.backbone_k(images.to(device, non_blocking=True)), dim=1)
                     all_embeddings.append(embeddings.cpu())
                     all_image_bytes.extend(image_bytes_batch)
+                    # Log progress every 10%
+                    if (batch_idx + 1) % max(1, total_batches // 10) == 0 or batch_idx == total_batches - 1:
+                        pct = (batch_idx + 1) / total_batches * 100
+                        logger.info(f"        Embedding: {pct:.0f}% ({(batch_idx + 1) * batch_size:,}/{len(simple_ds):,})")
 
         model.train()
         return torch.cat(all_embeddings).numpy().astype(np.float32), all_image_bytes
