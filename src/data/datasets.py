@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 import pyarrow.parquet as pq
 import torch
+from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
 from src.data.file_utils import PILImage, decode_image, list_parquet_files
@@ -242,10 +243,13 @@ class PseudoPairTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor,
         idx_k = state.sample_partner(idx_q, rng)
         if idx_k is None:
             return None
-        bq, bk = self.mgr._image_bytes_cache.get(idx_q), self.mgr._image_bytes_cache.get(idx_k)
-        if not bq or not bk:
+        img_q, img_k = self.mgr.get_image(idx_q), self.mgr.get_image(idx_k)
+        if img_q is None or img_k is None:
             return None
         try:
-            return self.transform_q(decode_image(bq)), self.transform_k(decode_image(bk)), cid
+            # Handle both numpy arrays (binary) and bytes (parquet)
+            pil_q = Image.fromarray(img_q) if isinstance(img_q, np.ndarray) else decode_image(img_q)
+            pil_k = Image.fromarray(img_k) if isinstance(img_k, np.ndarray) else decode_image(img_k)
+            return self.transform_q(pil_q), self.transform_k(pil_k), cid
         except Exception:
             return None
