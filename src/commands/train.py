@@ -158,7 +158,8 @@ def cmd_train(cfg: DictConfig) -> None:
 
     # Datasets
     input_size = tuple(cfg.model.backbone.input_size)
-    t_q, t_k = build_view_transform(cfg.augmentation.view_1, input_size), build_view_transform(cfg.augmentation.view_2, input_size)
+    t_q = build_view_transform(cfg.augmentation.view_1, input_size=input_size)
+    t_k = build_view_transform(cfg.augmentation.view_2, input_size=input_size)
     stream_cfg = data_cfg.get("streaming", {})
     stream = data.StreamParams(
         shuffle_files=True, batch_read_rows=int(stream_cfg.get("batch_read_rows", 2048)),
@@ -168,7 +169,9 @@ def cmd_train(cfg: DictConfig) -> None:
     digi2real_ds = data.ParquetTwoViewDataset(digi2real_glob, t_q, t_k, stream=stream, allowed_identities=train_ids) if digi2real_glob else None
 
     base_samples = int(cfg.train.get("samples_per_epoch", 0)) or data.count_parquet_rows(digiface_glob)
-    num_batches, num_samples = compute_epoch_batch_counts(base_samples, batch_size, grad_accum)
+    num_batches, num_samples = compute_epoch_batch_counts(
+        base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
+    )
     num_workers = int(stream_cfg.get("num_workers", 4))
 
     # Log config summary
