@@ -318,7 +318,8 @@ def build_moco(cfg: Mapping[str, Any], device: torch.device | None = None) -> Mo
     backbone = build_backbone(backbone_cfg)
 
     ssl_cfg = cfg.get("ssl", {})
-    margin_cfg = ssl_cfg.get("margin_nce", {}) if isinstance(ssl_cfg, dict) else {}
+    # Handle both dict and DictConfig (OmegaConf)
+    margin_cfg = ssl_cfg.get("margin_nce", {}) if hasattr(ssl_cfg, "get") else {}
 
     margin_enabled = bool(margin_cfg.get("enabled", True))
     margin = float(margin_cfg.get("margin", 0.10)) if margin_enabled else 0.0

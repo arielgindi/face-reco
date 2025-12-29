@@ -44,7 +44,12 @@ def load_checkpoint_for_resume(
     logger.info(f"Resuming from checkpoint: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    model.load_state_dict(ckpt["model"])
+    # Load model with strict=False to handle new buffers (e.g., queue_cluster_ids)
+    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    if missing:
+        logger.info(f"Missing keys (will use defaults): {missing}")
+    if unexpected:
+        logger.warning(f"Unexpected keys in checkpoint: {unexpected}")
     logger.info("Loaded model state")
 
     if not warm_start:
