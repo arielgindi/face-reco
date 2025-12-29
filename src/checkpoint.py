@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import torch
+import wandb
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -14,6 +16,46 @@ from torch.utils.data import DataLoader
 from src import data
 
 logger = logging.getLogger(__name__)
+
+
+def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
+    """Find the latest checkpoint from W&B or local folder.
+
+    Args:
+        project: W&B project name (e.g., "sniperface-v2")
+        local_dir: Local checkpoints directory to search if W&B fails
+
+    Returns:
+        Path to the latest checkpoint file
+
+    Raises:
+        FileNotFoundError: If no checkpoint found in W&B or locally
+    """
+    # Try W&B first
+    try:
+        api = wandb.Api()
+        # Get latest version of checkpoint artifact
+        artifact = api.artifact(f"{project}/checkpoint:latest")
+        # Download to temp directory
+        tmp_dir = Path(tempfile.gettempdir()) / "wandb_checkpoints"
+        tmp_dir.mkdir(exist_ok=True)
+        artifact_dir = Path(artifact.download(root=str(tmp_dir)))
+        # Find the .pt file in the artifact
+        pt_files = list(artifact_dir.glob("*.pt"))
+        if pt_files:
+            logger.info(f"Found checkpoint in W&B: {artifact.name}")
+            return pt_files[0]
+    except Exception as e:
+        logger.debug(f"W&B checkpoint not found: {e}")
+
+    # Fall back to local folder
+    if local_dir and local_dir.exists():
+        ckpts = sorted(local_dir.glob("epoch_*.pt"))
+        if ckpts:
+            logger.info(f"Found local checkpoint: {ckpts[-1].name}")
+            return ckpts[-1]
+
+    raise FileNotFoundError("No checkpoint found in W&B or locally")
 
 
 def load_checkpoint_for_resume(
