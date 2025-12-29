@@ -150,8 +150,9 @@ train:
   epochs: 75
   samples_per_epoch: 0
 
-  # Warm start (epoch counter resets to 0)
-  resume: "checkpoints/epoch_039.pt"
+  # Warm start (epoch counter resets to 0, optimizer/pseudo state cleared)
+  resume: "checkpoints_v1/epoch_039.pt"
+  warm_start: true  # Reset epoch to 0, only load model weights
 
   precision:
     amp: true

@@ -22,8 +22,21 @@ def load_checkpoint_for_resume(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler | None,
     device: torch.device,
+    *,
+    pseudo_manager: Any = None,
+    warm_start: bool = False,
 ) -> int:
-    """Load checkpoint and return the epoch to resume from."""
+    """Load checkpoint and return the epoch to resume from.
+
+    Args:
+        resume_path: Path to checkpoint file
+        model: Model to load weights into
+        optimizer: Optimizer to load state into
+        scaler: Optional AMP scaler
+        device: Target device
+        pseudo_manager: Optional PseudoIDManager to load state into
+        warm_start: If True, reset epoch to 0 and clear pseudo state
+    """
     path = Path(resume_path)
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
@@ -34,15 +47,33 @@ def load_checkpoint_for_resume(
     model.load_state_dict(ckpt["model"])
     logger.info("Loaded model state")
 
-    optimizer.load_state_dict(ckpt["optimizer"])
-    logger.info("Loaded optimizer state")
+    if not warm_start:
+        optimizer.load_state_dict(ckpt["optimizer"])
+        logger.info("Loaded optimizer state")
 
-    if scaler is not None and "scaler" in ckpt:
-        scaler.load_state_dict(ckpt["scaler"])
-        logger.info("Loaded AMP scaler state")
+        if scaler is not None and "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+            logger.info("Loaded AMP scaler state")
 
-    start_epoch = int(ckpt["epoch"])
-    logger.info(f"Resuming from epoch {start_epoch}")
+        # Load pseudo-ID state if available and not warm starting
+        if pseudo_manager is not None and "pseudo" in ckpt:
+            from src.pseudo import PseudoIDState
+
+            pseudo_data = ckpt["pseudo"]
+            pseudo_manager.state = PseudoIDState.from_dict(pseudo_data)
+            logger.info(
+                f"Loaded pseudo-ID state: {pseudo_manager.num_clusters} clusters, "
+                f"last refresh at epoch {pseudo_manager.last_refresh_epoch}"
+            )
+
+        start_epoch = int(ckpt["epoch"])
+        logger.info(f"Resuming from epoch {start_epoch}")
+    else:
+        # Warm start: reset epoch, don't load optimizer/scaler/pseudo
+        start_epoch = 0
+        if pseudo_manager is not None:
+            pseudo_manager.clear()
+        logger.info("Warm start: epoch reset to 0, optimizer/pseudo state cleared")
 
     return start_epoch
 
@@ -55,8 +86,19 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scaler: torch.amp.GradScaler | None,
     cfg: DictConfig,
+    pseudo_manager: Any = None,
 ) -> Path:
-    """Save a training checkpoint."""
+    """Save a training checkpoint.
+
+    Args:
+        out_dir: Output directory
+        epoch: Current epoch (1-indexed, after completion)
+        model: Model to save
+        optimizer: Optimizer to save
+        scaler: Optional AMP scaler
+        cfg: Config to save
+        pseudo_manager: Optional PseudoIDManager to save state from
+    """
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / f"epoch_{epoch:03d}.pt"
@@ -69,6 +111,10 @@ def save_checkpoint(
     }
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()
+
+    # Save pseudo-ID state if available
+    if pseudo_manager is not None and pseudo_manager.state is not None:
+        payload["pseudo"] = pseudo_manager.state.to_dict()
 
     torch.save(payload, path)
     return path
