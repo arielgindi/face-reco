@@ -44,8 +44,19 @@ def load_checkpoint_for_resume(
     logger.info(f"Resuming from checkpoint: {path}")
     ckpt = torch.load(path, map_location=device, weights_only=False)
 
-    # Load model with strict=False to handle new buffers (e.g., queue_cluster_ids)
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
+    # For warm start, filter out queue buffers (they may have different sizes)
+    ckpt_state = ckpt["model"]
+    if warm_start:
+        # Only load backbone and projector weights, skip queue buffers
+        skip_prefixes = ("queue", "queue_ptr", "queue_cluster_ids")
+        ckpt_state = {
+            k: v for k, v in ckpt_state.items()
+            if not k.startswith(skip_prefixes)
+        }
+        logger.info("Warm start: skipping queue buffers from checkpoint")
+
+    # Load model with strict=False to handle new/missing buffers
+    missing, unexpected = model.load_state_dict(ckpt_state, strict=False)
     if missing:
         logger.info(f"Missing keys (will use defaults): {missing}")
     if unexpected:
