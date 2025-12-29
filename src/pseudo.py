@@ -20,6 +20,8 @@ if TYPE_CHECKING:
     from src.data import ParquetTwoViewDataset
     from src.model import MoCo
 
+from src.data.binary_dataset import BinaryImageDataset
+
 logger = logging.getLogger(__name__)
 
 
@@ -309,27 +311,51 @@ class PseudoIDManager:
 
 
 class _SimpleImageDataset(Dataset):
-    """Simple dataset returning (tensor, bytes) without augmentation for embedding."""
+    """Simple dataset returning (tensor, bytes) without augmentation for embedding.
 
-    def __init__(self, parquet_dataset: ParquetTwoViewDataset, input_size: tuple[int, int] = (112, 112)):
-        from src.data.file_utils import list_parquet_files
-        self._rows: list[tuple[bytes, str]] = []
+    Supports both ParquetTwoViewDataset and BinaryImageDataset as input.
+    """
+
+    def __init__(self, dataset: ParquetTwoViewDataset | BinaryImageDataset, input_size: tuple[int, int] = (112, 112)):
         self._transform = transforms.Compose([
             transforms.Resize(input_size),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),
         ])
-        for path in list_parquet_files(parquet_dataset.parquet_glob):
-            table = pq.read_table(path, columns=["image_bytes", "identity_id"])
-            for i in range(table.num_rows):
-                identity_id = table["identity_id"][i].as_py()
-                if parquet_dataset.allowed_identities is None or identity_id in parquet_dataset.allowed_identities:
-                    self._rows.append((table["image_bytes"][i].as_py(), identity_id))
+
+        # Check if this is a binary dataset
+        if isinstance(dataset, BinaryImageDataset):
+            self._is_binary = True
+            self._binary_images: np.ndarray = dataset.images
+            self._rows: list[tuple[bytes, str]] = []  # Empty, not used for binary
+        else:
+            self._is_binary = False
+            self._binary_images = np.array([])  # Empty, not used for parquet
+            self._rows = []
+            from src.data.file_utils import list_parquet_files
+            for path in list_parquet_files(dataset.parquet_glob):
+                table = pq.read_table(path, columns=["image_bytes", "identity_id"])
+                for i in range(table.num_rows):
+                    identity_id = table["identity_id"][i].as_py()
+                    if dataset.allowed_identities is None or identity_id in dataset.allowed_identities:
+                        self._rows.append((table["image_bytes"][i].as_py(), identity_id))
 
     def __len__(self) -> int:
+        if self._is_binary:
+            return len(self._binary_images)
         return len(self._rows)
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, bytes]:
-        image_bytes, _ = self._rows[idx]
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        if self._is_binary:
+            # Binary dataset: image is numpy array (H, W, 3) uint8
+            img_array = self._binary_images[idx]
+            image = Image.fromarray(img_array, mode="RGB")
+            # Convert to JPEG bytes for caching (smaller than PNG)
+            buf = io.BytesIO()
+            image.save(buf, format="JPEG", quality=95)
+            image_bytes = buf.getvalue()
+        else:
+            # Parquet dataset: image is already bytes
+            image_bytes, _ = self._rows[idx]
+            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         return self._transform(image), image_bytes
