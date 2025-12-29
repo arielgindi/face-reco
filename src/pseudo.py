@@ -273,12 +273,14 @@ class PseudoIDManager:
         """Ultra-fast embedding for binary datasets - skip DataLoader entirely."""
         from src.model import l2_normalize
 
+        import sys
         num_images = len(images)
         embed_dim = 512  # Model output dimension
-        batch_size = 8192  # Large batch for GPU utilization
+        # Smaller batch on Windows to reduce memory pressure (mmap + file cache)
+        batch_size = 2048 if sys.platform == "win32" else 8192
 
-        # Pre-allocate output tensor on CPU (pinned memory for fast transfer)
-        all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32, pin_memory=True)
+        # Pre-allocate output (no pin_memory to avoid locking RAM)
+        all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
 
         total_batches = (num_images + batch_size - 1) // batch_size
         log_interval = max(1, total_batches // 10)
@@ -288,15 +290,17 @@ class PseudoIDManager:
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_images)
 
-                # Direct numpy -> GPU tensor (skip CPU tensor intermediate)
-                batch_np = images[start_idx:end_idx]  # (B, H, W, 3) uint8
-                batch_gpu = torch.from_numpy(batch_np).to(device, non_blocking=True)
-                # HWC uint8 -> CHW float32 normalized in one go
+                # Direct numpy -> GPU tensor
+                batch_np = np.ascontiguousarray(images[start_idx:end_idx])  # (B, H, W, 3) uint8
+                batch_gpu = torch.from_numpy(batch_np).to(device)
+                del batch_np  # Free numpy copy immediately
+                # HWC uint8 -> CHW float32 normalized
                 batch_gpu = batch_gpu.permute(0, 3, 1, 2).float().div_(255.0).sub_(0.5).div_(0.5)
 
                 # Forward pass
                 embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
                 all_embeddings[start_idx:end_idx] = embeddings.float().cpu()
+                del batch_gpu, embeddings  # Free GPU memory
 
                 if (batch_idx + 1) % log_interval == 0 or batch_idx == total_batches - 1:
                     pct = (batch_idx + 1) / total_batches * 100
