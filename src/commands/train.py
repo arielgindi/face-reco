@@ -326,9 +326,18 @@ def cmd_train(cfg: DictConfig) -> None:
             prune_checkpoints(out_dir / "checkpoints", keep_last)
             logger.info(f"Saved: {path.name}")
             if wandb_active and cfg.get("wandb", {}).get("save_artifacts"):
-                art = wandb.Artifact(f"model-epoch-{epoch+1:03d}", type="model", metadata={"epoch": epoch+1})
+                art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch+1})
                 art.add_file(str(path))
                 wandb.log_artifact(art)
+                # Prune old artifact versions, keep last 5
+                try:
+                    api = wandb.Api()
+                    collection = api.artifact_collection("model", f"{wandb.run.entity}/{wandb.run.project}/checkpoint")
+                    versions = sorted(collection.versions(), key=lambda a: int(a.version.lstrip("v")), reverse=True)
+                    for old in versions[5:]:
+                        old.delete()
+                except Exception:
+                    pass  # Don't crash training if cleanup fails
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
