@@ -235,6 +235,18 @@ class PseudoPairTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor,
             except StopIteration:
                 base_it = iter(self.base)
 
+    def _apply_transform(self, transform: Any, img: np.ndarray) -> torch.Tensor:
+        """Apply transform supporting both albumentations and torchvision."""
+        # Try albumentations (expects numpy + keyword "image")
+        try:
+            out = transform(image=img)
+            if isinstance(out, dict) and "image" in out:
+                return out["image"]
+        except TypeError:
+            pass
+        # Fallback to torchvision/PIL path
+        return transform(Image.fromarray(img))
+
     def _sample_pseudo(self, rng: np.random.Generator, state: Any) -> tuple[torch.Tensor, torch.Tensor, int] | None:
         idx_q = rng.choice(self._clustered)
         cid = state.get_cluster(idx_q)
@@ -248,8 +260,11 @@ class PseudoPairTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor,
             return None
         try:
             # Handle both numpy arrays (binary) and bytes (parquet)
-            pil_q = Image.fromarray(img_q) if isinstance(img_q, np.ndarray) else decode_image(img_q)
-            pil_k = Image.fromarray(img_k) if isinstance(img_k, np.ndarray) else decode_image(img_k)
+            if isinstance(img_q, np.ndarray) and isinstance(img_k, np.ndarray):
+                return self._apply_transform(self.transform_q, img_q), self._apply_transform(self.transform_k, img_k), cid
+            # Bytes/parquet path
+            pil_q = decode_image(img_q)
+            pil_k = decode_image(img_k)
             return self.transform_q(pil_q), self.transform_k(pil_k), cid
         except Exception:
             return None
