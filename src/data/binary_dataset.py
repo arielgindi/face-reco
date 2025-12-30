@@ -78,36 +78,47 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         return self._num_images
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        """Yield (view_q, view_k) pairs forever with per-epoch shuffling."""
+        """Yield (view_q, view_k) pairs with block shuffle for sequential IO."""
         info = get_worker_info()
         if info is None:
             wid, nw = 0, 1
         else:
             wid, nw = info.id, info.num_workers
 
-        # Each worker gets interleaved indices
-        all_indices = np.arange(self._num_images)
-        my_indices = all_indices[wid::nw]
+        N = self._num_images
+
+        # Contiguous shard per worker (much better for mmap + Windows file cache)
+        per_worker = (N + nw - 1) // nw
+        start = wid * per_worker
+        end = min(start + per_worker, N)
+        my_indices = np.arange(start, end, dtype=np.int64)
 
         # Per-worker RNG
         rng = np.random.default_rng(self.seed + wid * 1009)
 
+        # Block shuffle: keeps IO mostly sequential
+        BLOCK = 8192
         epoch = 0
         while True:
-            # Shuffle for this epoch
-            epoch_indices = my_indices.copy()
-            rng.shuffle(epoch_indices)
+            # Shuffle blocks, not individual indices
+            blocks = np.arange(0, len(my_indices), BLOCK, dtype=np.int64)
+            rng.shuffle(blocks)
 
-            for idx in epoch_indices:
-                img = self.images[idx]  # (H, W, 3) uint8, zero-copy
+            for b in blocks:
+                block = my_indices[b : b + BLOCK].copy()
+                # Light shuffle within block (still local/sequential-ish)
+                rng.shuffle(block)
 
-                try:
-                    # Albumentations: numpy HWC -> Tensor CHW
-                    view_q = self.transform_q(image=img)["image"]
-                    view_k = self.transform_k(image=img)["image"]
-                    yield view_q, view_k
-                except Exception:
-                    continue
+                for idx in block:
+                    img = self.images[idx]  # (H, W, 3) uint8
+
+                    try:
+                        # Albumentations: numpy HWC -> Tensor CHW
+                        view_q = self.transform_q(image=img)["image"]
+                        view_k = self.transform_k(image=img)["image"]
+                        yield view_q, view_k
+                    except Exception:
+                        continue
 
             epoch += 1
 
