@@ -358,28 +358,42 @@ def cmd_train(cfg: DictConfig) -> None:
         if (epoch + 1) % save_every == 0 or epoch + 1 == epochs:
             path = save_checkpoint(out_dir, epoch=epoch+1, model=model, optimizer=optimizer, scaler=scaler, cfg=cfg, pseudo_manager=pseudo_mgr)
 
-            # Upload to W&B
+            # Upload to W&B with retry
+            upload_success = False
             if wandb_active and cfg.get("wandb", {}).get("save_artifacts"):
-                art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch+1})
-                art.add_file(str(path))
-                wandb.log_artifact(art)
-                logger.info(f"Uploaded: {path.name}")
-                # Prune old artifact versions, keep last 5
-                try:
-                    api = wandb.Api()
-                    collection = api.artifact_collection("model", f"{wandb.run.entity}/{wandb.run.project}/checkpoint")
-                    versions = sorted(collection.versions(), key=lambda a: int(a.version.lstrip("v")), reverse=True)
-                    for old in versions[5:]:
-                        old.delete()
-                except Exception:
-                    pass  # Don't crash training if cleanup fails
+                for attempt in range(3):
+                    try:
+                        art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch+1})
+                        art.add_file(str(path))
+                        wandb.log_artifact(art, aliases=["latest"])
+                        art.wait()  # Wait for upload to complete
+                        upload_success = True
+                        logger.info(f"Uploaded: {path.name}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Upload attempt {attempt+1}/3 failed: {e}")
+                        time.sleep(5)
 
-            # Handle local storage
-            if save_local:
+                if not upload_success:
+                    logger.error(f"Failed to upload {path.name} after 3 attempts - keeping local copy")
+
+                # Prune old artifact versions, keep last 5
+                if upload_success:
+                    try:
+                        api = wandb.Api()
+                        collection = api.artifact_collection("model", f"{wandb.run.entity}/{wandb.run.project}/checkpoint")
+                        versions = sorted(collection.versions(), key=lambda a: int(a.version.lstrip("v")), reverse=True)
+                        for old in versions[5:]:
+                            old.delete()
+                    except Exception:
+                        pass  # Don't crash training if cleanup fails
+
+            # Handle local storage - keep if upload failed
+            if save_local or not upload_success:
                 prune_checkpoints(out_dir / "checkpoints", keep_last)
                 logger.info(f"Saved locally: {path.name}")
             else:
-                path.unlink(missing_ok=True)  # Delete after W&B upload
+                path.unlink(missing_ok=True)  # Delete only after confirmed upload
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
