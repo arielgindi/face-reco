@@ -290,8 +290,8 @@ class PseudoIDManager:
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_images)
 
-                # Direct numpy -> GPU tensor
-                batch_np = np.ascontiguousarray(images[start_idx:end_idx])  # (B, H, W, 3) uint8
+                # Direct numpy -> GPU tensor (writable copy for torch compatibility)
+                batch_np = np.array(images[start_idx:end_idx], copy=True, order="C")
                 batch_gpu = torch.from_numpy(batch_np).to(device)
                 del batch_np  # Free numpy copy immediately
                 # HWC uint8 -> CHW float32 normalized

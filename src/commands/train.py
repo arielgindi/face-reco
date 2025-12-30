@@ -251,9 +251,13 @@ def cmd_train(cfg: DictConfig) -> None:
 
         # Build epoch dataset
         if use_binary:
-            # Binary mode: direct iteration, no curriculum/pseudo (pre-merged data)
-            epoch_ds = data.BinaryMixDataset(digiface_ds, None, 1.0, num_samples, seed + epoch * 17)
-            use_pseudo = False
+            # Binary mode with pseudo-ID support
+            base_ds = data.BinaryMixDataset(digiface_ds, None, 1.0, num_samples, seed + epoch * 17)
+            use_pseudo = pseudo_mgr and pseudo_mgr.state is not None and p_pseudo > 0
+            epoch_ds = (
+                data.PseudoPairTwoViewDataset(base_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17)
+                if use_pseudo else base_ds
+            )
         else:
             curr_ds = data.CurriculumMixTwoViewDataset(digiface_ds, digi2real_ds, p_digi, num_samples, seed + epoch * 17)
             use_pseudo = pseudo_mgr and pseudo_mgr.state is not None
