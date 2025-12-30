@@ -8,9 +8,25 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import torch.distributed as dist
 from torch.utils.data import IterableDataset, get_worker_info
 
 logger = logging.getLogger(__name__)
+
+
+def _global_worker_info() -> tuple[int, int]:
+    """Get global (worker_id, total_workers) across DDP ranks + DataLoader workers."""
+    info = get_worker_info()
+    wid, nw = (0, 1) if info is None else (info.id, info.num_workers)
+
+    if dist.is_initialized():
+        rank, world_size = dist.get_rank(), dist.get_world_size()
+    else:
+        rank, world_size = 0, 1
+
+    total = world_size * nw
+    gid = rank * nw + wid
+    return gid, total
 
 
 class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -79,22 +95,18 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         """Yield (view_q, view_k) pairs with block shuffle for sequential IO."""
-        info = get_worker_info()
-        if info is None:
-            wid, nw = 0, 1
-        else:
-            wid, nw = info.id, info.num_workers
+        gid, total = _global_worker_info()
 
         N = self._num_images
 
-        # Contiguous shard per worker (much better for mmap + Windows file cache)
-        per_worker = (N + nw - 1) // nw
-        start = wid * per_worker
+        # Contiguous shard per global worker (DDP rank * DataLoader workers)
+        per_worker = (N + total - 1) // total
+        start = gid * per_worker
         end = min(start + per_worker, N)
         my_indices = np.arange(start, end, dtype=np.int64)
 
-        # Per-worker RNG
-        rng = np.random.default_rng(self.seed + wid * 1009)
+        # Per-worker RNG (unique across all ranks + workers)
+        rng = np.random.default_rng(self.seed + gid * 7919)
 
         # Block shuffle: keeps IO mostly sequential
         BLOCK = 8192
@@ -149,14 +161,10 @@ class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         return self.num_samples
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        info = get_worker_info()
-        if info is None:
-            wid, nw = 0, 1
-        else:
-            wid, nw = info.id, info.num_workers
+        gid, total = _global_worker_info()
 
-        target = self.num_samples // nw + (1 if wid < self.num_samples % nw else 0)
-        rng = np.random.default_rng(self.seed + wid * 9176)
+        target = self.num_samples // total + (1 if gid < self.num_samples % total else 0)
+        rng = np.random.default_rng(self.seed + gid * 7919)
 
         it_a = iter(self.dataset_a)
         it_b = iter(self.dataset_b) if self.dataset_b else None

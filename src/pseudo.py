@@ -209,9 +209,9 @@ class PseudoIDManager:
             sim_threshold_used=sim_threshold,
         )
         # Store image references - for binary mode, store dataset reference; for parquet, store bytes
-        if image_bytes_list and isinstance(image_bytes_list[0], bytes) and len(image_bytes_list[0]) == 4:
-            # Binary mode: image_bytes_list contains indices, store reference to binary dataset
-            self._binary_images = datasets[0].images if hasattr(datasets[0], 'images') else None
+        if hasattr(datasets[0], 'images'):
+            # Binary mode: store reference to binary dataset's images array
+            self._binary_images = datasets[0].images
             self._image_bytes_cache.clear()
         else:
             # Parquet mode: store actual bytes
@@ -271,11 +271,11 @@ class PseudoIDManager:
 
     def _embed_binary_fast(self, model: MoCo, images: np.ndarray, device: torch.device) -> tuple[np.ndarray, list[bytes]]:
         """Ultra-fast embedding for binary datasets - skip DataLoader entirely."""
-        from src.model import l2_normalize
-
         import sys
+
+        from src.model import l2_normalize
         num_images = len(images)
-        embed_dim = 512  # Model output dimension
+        embed_dim = model.cfg.embedding_dim
         # Smaller batch on Windows to reduce memory pressure (mmap + file cache)
         batch_size = 2048 if sys.platform == "win32" else 8192
 
@@ -304,8 +304,9 @@ class PseudoIDManager:
 
                 if (batch_idx + 1) % log_interval == 0 or batch_idx == total_batches - 1:
                     pct = (batch_idx + 1) / total_batches * 100
-                    ips = (end_idx) / (time.perf_counter() - self._embed_start_time) if hasattr(self, '_embed_start_time') else 0
-                    logger.info(f"        Embedding: {pct:.0f}% ({end_idx:,}/{num_images:,})")
+                    elapsed = time.perf_counter() - self._embed_start_time if hasattr(self, '_embed_start_time') else 1
+                    ips = end_idx / elapsed
+                    logger.info(f"        Embedding: {pct:.0f}% ({end_idx:,}/{num_images:,}) @ {ips:,.0f} img/s")
 
         model.train()
         # Return indices as bytes for binary mode
@@ -327,13 +328,13 @@ class PseudoIDManager:
                 gpu_resources.setTempMemory(2 << 30)  # 2GB temp memory
                 use_gpu = True
             except Exception as e:
-                logger.debug(f"FAISS GPU unavailable: {e}")
+                logger.warning(f"FAISS GPU unavailable, falling back to CPU (slower): {e}")
 
             if use_gpu:
                 # GPU: use flat index (fast enough with GPU)
                 index = faiss.IndexFlatIP(embed_dim)
                 index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
-                logger.info(f"        k-NN backend: FAISS-GPU")
+                logger.info("        k-NN backend: FAISS-GPU")
             else:
                 # CPU: use IVF index for speed (approximate but much faster)
                 nlist = min(4096, num_images // 100)  # Number of clusters

@@ -9,8 +9,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+import pyarrow as pa
 import pyarrow.parquet as pq
 import torch
+import torch.distributed as dist
 from PIL import Image
 from torch.utils.data import IterableDataset, get_worker_info
 
@@ -55,10 +57,31 @@ def _worker_info() -> tuple[int, int]:
     return (0, 1) if info is None else (info.id, info.num_workers)
 
 
-def _shard_files(files: list[Path]) -> list[Path]:
-    """Shard files across DataLoader workers."""
+def _distributed_info() -> tuple[int, int]:
+    """Get (rank, world_size) for distributed training."""
+    if dist.is_initialized():
+        return dist.get_rank(), dist.get_world_size()
+    return 0, 1
+
+
+def _global_worker_info() -> tuple[int, int]:
+    """Get global (worker_id, total_workers) across all ranks and DataLoader workers.
+
+    For DDP + DataLoader workers, total shards = world_size * num_workers.
+    Global worker ID = rank * num_workers + worker_id.
+    """
     wid, nw = _worker_info()
-    return files[wid::nw]
+    rank, world_size = _distributed_info()
+
+    total_workers = world_size * nw
+    global_id = rank * nw + wid
+    return global_id, total_workers
+
+
+def _shard_files(files: list[Path]) -> list[Path]:
+    """Shard files across all workers (DDP ranks + DataLoader workers)."""
+    gid, total = _global_worker_info()
+    return files[gid::total]
 
 
 class ParquetTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -78,7 +101,7 @@ class ParquetTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         files = _shard_files(list(self._files))
         wid, _ = _worker_info()
-        rng = np.random.default_rng(self.stream.seed + wid * 1009)
+        rng = np.random.default_rng(self.stream.seed + wid * 7919)
         buf = ShuffleBuffer(self.stream.shuffle_buffer_size, rng) if self.stream.shuffle_buffer_size > 0 else None
         need_filter = self.allowed_identities is not None
         cols = ["identity_id", "image_bytes"] if need_filter else ["image_bytes"]
@@ -89,30 +112,34 @@ class ParquetTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
             for fp in files:
                 try:
                     pf = pq.ParquetFile(fp)
-                except Exception:
+                except (OSError, pa.ArrowInvalid):
                     continue
-                for batch in pf.iter_batches(batch_size=self.stream.batch_read_rows, columns=cols):
-                    if need_filter:
-                        rows = list(zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True))
-                    else:
-                        rows = [(None, b) for b in batch.column(0).to_pylist()]
-                    if self.stream.shuffle_within_batch and len(rows) > 1:
-                        rows = [rows[i] for i in rng.permutation(len(rows))]
-                    for iid, img_bytes in rows:
-                        if img_bytes is None:
-                            continue
-                        if need_filter and str(iid) not in self.allowed_identities:
-                            continue
-                        try:
-                            img = decode_image(img_bytes)
-                            sample = (self.transform_q(img), self.transform_k(img))
-                        except Exception:
-                            continue
-                        if buf:
-                            out = buf.add(sample)
-                            if out: yield out
+                try:
+                    for batch in pf.iter_batches(batch_size=self.stream.batch_read_rows, columns=cols):
+                        if need_filter:
+                            rows = list(zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(), strict=True))
                         else:
-                            yield sample
+                            rows = [(None, b) for b in batch.column(0).to_pylist()]
+                        if self.stream.shuffle_within_batch and len(rows) > 1:
+                            rows = [rows[i] for i in rng.permutation(len(rows))]
+                        for iid, img_bytes in rows:
+                            if img_bytes is None:
+                                continue
+                            if need_filter and str(iid) not in self.allowed_identities:
+                                continue
+                            try:
+                                img = decode_image(img_bytes)
+                                sample = (self.transform_q(img), self.transform_k(img))
+                            except (OSError, ValueError):
+                                continue
+                            if buf:
+                                out = buf.add(sample)
+                                if out:
+                                    yield out
+                            else:
+                                yield sample
+                finally:
+                    pf.close()
             if buf:
                 yield from buf.flush()
 
@@ -133,20 +160,23 @@ class ParquetEmbedDataset(IterableDataset[tuple[str, str, torch.Tensor]]):
         for fp in _shard_files(list(self._files)):
             try:
                 pf = pq.ParquetFile(fp)
-            except Exception:
+            except (OSError, pa.ArrowInvalid):
                 continue
-            for batch in pf.iter_batches(batch_size=self.batch_read_rows,
-                                          columns=["identity_id", "image_filename", "image_bytes"]):
-                for iid, fn, img_bytes in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(),
-                                               batch.column(2).to_pylist(), strict=True):
-                    if img_bytes is None:
-                        continue
-                    if self.allowed_identities and str(iid) not in self.allowed_identities:
-                        continue
-                    try:
-                        yield str(iid), str(fn), self.transform(decode_image(img_bytes))
-                    except Exception:
-                        continue
+            try:
+                for batch in pf.iter_batches(batch_size=self.batch_read_rows,
+                                              columns=["identity_id", "image_filename", "image_bytes"]):
+                    for iid, fn, img_bytes in zip(batch.column(0).to_pylist(), batch.column(1).to_pylist(),
+                                                   batch.column(2).to_pylist(), strict=True):
+                        if img_bytes is None:
+                            continue
+                        if self.allowed_identities and str(iid) not in self.allowed_identities:
+                            continue
+                        try:
+                            yield str(iid), str(fn), self.transform(decode_image(img_bytes))
+                        except (OSError, ValueError):
+                            continue
+            finally:
+                pf.close()
 
 
 class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
@@ -159,9 +189,9 @@ class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tens
         self.p_digiface, self.num_samples, self.seed, self.chunk_size = float(p_digiface), num_samples, seed, chunk_size
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
-        wid, nw = _worker_info()
-        target = self.num_samples // nw + (1 if wid < self.num_samples % nw else 0)
-        rng = np.random.default_rng(self.seed + wid * 9176)
+        gid, total = _global_worker_info()
+        target = self.num_samples // total + (1 if gid < self.num_samples % total else 0)
+        rng = np.random.default_rng(self.seed + gid * 7919)
 
         it_a, it_b = iter(self.digiface), iter(self.digi2real) if self.digi2real else None
         produced, cnt_a, cnt_b = 0, 0, 0
@@ -174,8 +204,8 @@ class CurriculumMixTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tens
             elif self.p_digiface <= 0.0:
                 pick_a = False
             else:
-                total = cnt_a + cnt_b
-                pick_a = rng.random() < self.p_digiface if total == 0 else (cnt_a / total) < self.p_digiface
+                sample_count = cnt_a + cnt_b
+                pick_a = rng.random() < self.p_digiface if sample_count == 0 else (cnt_a / sample_count) < self.p_digiface
 
             it = it_a if pick_a else it_b
             got = 0
@@ -212,9 +242,9 @@ class PseudoPairTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor,
         self._clustered = [i for i, c in enumerate(state.image_to_cluster) if c >= 0] if state else []
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor, int]]:
-        wid, nw = _worker_info()
-        target = self.num_samples // nw + (1 if wid < self.num_samples % nw else 0)
-        rng = np.random.default_rng(self.seed + wid * 7919)
+        gid, total = _global_worker_info()
+        target = self.num_samples // total + (1 if gid < self.num_samples % total else 0)
+        rng = np.random.default_rng(self.seed + gid * 7919)
         base_it = iter(self.base)
         produced = 0
 

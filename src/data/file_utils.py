@@ -18,7 +18,7 @@ PILImage = Image.Image
 def list_parquet_files(glob_pattern: str) -> list[Path]:
     """Return sorted parquet file paths for a glob pattern."""
     paths = [Path(p) for p in glob.glob(glob_pattern, recursive=True)]
-    return sorted(paths)
+    return sorted(paths, key=lambda p: str(p.resolve()))
 
 
 def ensure_dir(path: Path) -> None:

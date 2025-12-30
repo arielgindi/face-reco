@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -54,6 +55,17 @@ class MoCoConfig:
     temperature: float = 0.07
     margin: float = 0.10
     l2_normalize_backbone: bool = True
+
+    def __post_init__(self) -> None:
+        """Validate configuration parameters."""
+        if self.temperature <= 0:
+            raise ValueError(f"temperature must be > 0, got {self.temperature}")
+        if not 0 <= self.momentum <= 1:
+            raise ValueError(f"momentum must be in [0, 1], got {self.momentum}")
+        if self.queue_size <= 0:
+            raise ValueError(f"queue_size must be > 0, got {self.queue_size}")
+        if self.margin < 0:
+            raise ValueError(f"margin must be >= 0, got {self.margin}")
 
 
 class MoCo(nn.Module):
@@ -159,12 +171,52 @@ class MoCo(nn.Module):
             param_k.data.mul_(m).add_(param_q.data, alpha=1.0 - m)
 
     @torch.no_grad()
+    def _gather_from_all_gpus(
+        self,
+        tensor: torch.Tensor,
+    ) -> torch.Tensor:
+        """Gather tensors from all GPUs (for DDP queue sync).
+
+        Args:
+            tensor: Local tensor to gather (B, D) or (B,).
+
+        Returns:
+            Concatenated tensor from all ranks (B*world_size, D) or (B*world_size,).
+        """
+        if not dist.is_initialized():
+            return tensor
+
+        world_size = dist.get_world_size()
+        if world_size == 1:
+            return tensor
+
+        # Create placeholder tensors for gathering
+        gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
+        dist.all_gather(gathered, tensor)
+
+        # Concatenate along batch dimension
+        return torch.cat(gathered, dim=0)
+
+    @torch.no_grad()
     def _dequeue_and_enqueue(
         self,
         keys: torch.Tensor,
         cluster_ids: torch.Tensor | None = None,
+        sync_ddp: bool = True,
     ) -> None:
-        """Update queue with the latest batch of key projections."""
+        """Update queue with the latest batch of key projections.
+
+        Args:
+            keys: Key embeddings from this GPU (B, D).
+            cluster_ids: Optional pseudo-cluster IDs (B,).
+            sync_ddp: If True and in DDP mode, gather keys from all GPUs first.
+        """
+        # Gather from all GPUs for synchronized queue in DDP
+        if sync_ddp and dist.is_initialized() and dist.get_world_size() > 1:
+            keys = self._gather_from_all_gpus(keys)
+            if cluster_ids is not None:
+                cluster_ids = self._gather_from_all_gpus(cluster_ids)
+
         keys = keys.detach()
         batch_size = keys.shape[0]
         ptr = int(self.queue_ptr.item())
@@ -191,6 +243,10 @@ class MoCo(nn.Module):
             ptr = (ptr + batch_size) % k
 
         self.queue_ptr[0] = ptr
+
+        # Synchronize queue pointer across all ranks to prevent divergence
+        if dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Produce the backbone embedding for retrieval (512-D by default)."""
@@ -284,7 +340,7 @@ class MoCo(nn.Module):
         stats: dict[str, Any] = {
             "loss": float(loss.detach().cpu()),
             "pos_sim": float((l_pos + self.cfg.margin).mean().detach().cpu()),
-            "neg_sim": float(l_neg[l_neg > float("-inf")].mean().detach().cpu()) if neg_masked_count < batch_size * queue_size else 0.0,
+            "neg_sim": float(valid_neg.mean().detach().cpu()) if (valid_neg := l_neg[l_neg > float("-inf")]).numel() > 0 else 0.0,
             "queue_ptr": int(self.queue_ptr.item()),
             "emb_std": float(emb_q.detach().std(dim=0).mean().cpu()),
             "neg_masked_pct": neg_masked_count / (batch_size * queue_size) if queue_size > 0 else 0.0,

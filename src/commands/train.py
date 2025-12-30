@@ -7,10 +7,13 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from omegaconf import DictConfig
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -34,7 +37,14 @@ from src.schedule import (
     get_pseudo_prob,
     get_refresh_epochs,
 )
-from src.utils import compute_epoch_batch_counts, configure_precision, select_device, set_seed
+from src.utils import (
+    DistributedContext,
+    cleanup_distributed,
+    compute_epoch_batch_counts,
+    configure_precision,
+    set_seed,
+    setup_distributed,
+)
 from src.wandb_utils import finish_wandb, init_wandb, log_gpu_memory, log_wandb
 
 logger = logging.getLogger(__name__)
@@ -49,20 +59,32 @@ def _fmt_time(s: float) -> str:
     return f"{int(s//3600)}h {int((s%3600)//60)}m"
 
 
-def _log_config(cfg: DictConfig, device: torch.device, num_params: int,
+def _log_config(cfg: DictConfig, dist_ctx: DistributedContext, num_params: int,
                 n_ids: int, n_samples: int, n_batches: int, start: int) -> None:
-    """Log training configuration summary."""
+    """Log training configuration summary (main process only)."""
+    if not dist_ctx.is_main:
+        return
+
     ssl, pseudo, train = cfg.get("ssl", {}), cfg.get("pseudo", {}), cfg.train
-    gpu = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
-    mem = f"{torch.cuda.get_device_properties(0).total_memory/1e9:.1f}GB" if device.type == "cuda" else ""
+    device = dist_ctx.device
+    gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+    mem = f"{torch.cuda.get_device_properties(device).total_memory/1e9:.1f}GB" if device.type == "cuda" else ""
 
     logger.info("\n" + "="*70)
     logger.info("  SNIPERFACE TRAINING")
     logger.info("="*70)
+
+    # Show distributed info
+    if dist_ctx.enabled:
+        logger.info(f"  Distributed: {dist_ctx.world_size} GPUs (NCCL)")
     logger.info(f"  GPU: {gpu} ({mem})  |  Precision: {'FP16' if train.precision.amp else 'FP32'}")
     logger.info(f"  Model: {cfg.model.backbone.name} ({num_params:,} params, {cfg.model.backbone.embedding_dim}D)")
     logger.info(f"  SSL: queue={ssl.get('queue_size',32768):,} temp={ssl.get('temperature',0.07)} margin={ssl.get('margin_nce',{}).get('margin',0.1)}")
-    logger.info(f"  Training: epochs {start}->{train.epochs-1} | batch {train.batch.size}x{train.batch.grad_accum_steps} | lr={train.optimizer.lr}")
+
+    # Show effective batch size for DDP
+    batch_per_gpu = train.batch.size
+    effective_batch = batch_per_gpu * dist_ctx.world_size * train.batch.grad_accum_steps
+    logger.info(f"  Training: epochs {start}->{train.epochs-1} | batch {batch_per_gpu}x{dist_ctx.world_size}x{train.batch.grad_accum_steps}={effective_batch} | lr={train.optimizer.lr}")
     logger.info(f"  Data: {n_ids:,} identities | {n_samples:,} samples/epoch | {n_batches//train.batch.grad_accum_steps:,} steps")
     if pseudo.get("enabled"):
         th = pseudo.get("sim_threshold", {})
@@ -79,7 +101,7 @@ def _get_phase(epoch: int) -> str:
     return "C:Refine"
 
 
-def _build_lr_fn(cfg: DictConfig):
+def _build_lr_fn(cfg: DictConfig) -> Callable[[int], float]:
     """Build learning rate schedule function."""
     sched = cfg.train.lr_schedule
     milestones, gamma = list(sched.milestones), float(sched.gamma)
@@ -97,16 +119,20 @@ def _build_lr_fn(cfg: DictConfig):
 
 def cmd_train(cfg: DictConfig) -> None:
     """Train MoCo + MarginNCE face encoder with optional pseudo-ID bootstrapping."""
-    # Setup
+    # Setup distributed (auto-detects torchrun or single-GPU)
+    dist_ctx = setup_distributed()
+    device = dist_ctx.device
+
     seed = int(cfg.get("experiment", {}).get("seed", 42))
-    set_seed(seed, bool(cfg.get("experiment", {}).get("deterministic", False)))
+    set_seed(seed, bool(cfg.get("experiment", {}).get("deterministic", False)), rank=dist_ctx.rank)
     amp_enabled, amp_dtype, tf32 = configure_precision(cfg)
     if tf32 and torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
 
-    device = select_device()
     out_dir = Path(os.getcwd())
-    wandb_active = init_wandb(cfg, out_dir)
+
+    # Only init wandb on main process
+    wandb_active = init_wandb(cfg, out_dir) if dist_ctx.is_main else False
     log_every = int(cfg.get("wandb", {}).get("log_every_steps", 50))
 
     # Data splits
@@ -122,7 +148,8 @@ def cmd_train(cfg: DictConfig) -> None:
         train_ratio=float(split_cfg.get("train_ratio", 0.75)), seed=int(split_cfg.get("seed", seed)),
     )
     train_ids = data.get_identity_set(splits_path, "train")
-    shutil.copy2(splits_path, out_dir / "identity_splits.parquet")
+    if dist_ctx.is_main:
+        shutil.copy2(splits_path, out_dir / "identity_splits.parquet")
 
     # Model & optimizer
     model = build_moco(cfg, device=device)
@@ -169,12 +196,19 @@ def cmd_train(cfg: DictConfig) -> None:
             pseudo_manager=pseudo_mgr, warm_start=bool(cfg.train.get("warm_start", False)),
         )
 
-    # Torch compile (Linux only)
+    # Wrap in DDP if distributed (before torch.compile)
+    if dist_ctx.enabled:
+        model = DDP(model, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank)
+        if dist_ctx.is_main:
+            logger.info(f"Wrapped model in DDP ({dist_ctx.world_size} GPUs)")
+
+    # Torch compile (Linux only, after DDP wrap)
     if device.type == "cuda" and sys.platform != "win32" and cfg.train.precision.get("torch_compile"):
         torch._dynamo.config.capture_scalar_outputs = True
-        cc = torch.cuda.get_device_capability(0)
+        cc = torch.cuda.get_device_capability(device)
         if cc[0] >= 12:  # Blackwell (sm_120) - use cudagraphs backend (Triton has issues)
-            logger.info(f"Using cudagraphs backend for Blackwell GPU (sm_{cc[0]}{cc[1]})")
+            if dist_ctx.is_main:
+                logger.info(f"Using cudagraphs backend for Blackwell GPU (sm_{cc[0]}{cc[1]})")
             model = torch.compile(model, backend="cudagraphs")
         else:
             model = torch.compile(model, mode="reduce-overhead")
@@ -210,8 +244,8 @@ def cmd_train(cfg: DictConfig) -> None:
         base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
     )
 
-    # Log config summary
-    _log_config(cfg, device, num_params, len(train_ids), num_samples, num_batches, start_epoch)
+    # Log config summary (main process only)
+    _log_config(cfg, dist_ctx, num_params, len(train_ids), num_samples, num_batches, start_epoch)
 
     # Schedules
     lr_fn = _build_lr_fn(cfg)
@@ -228,6 +262,10 @@ def cmd_train(cfg: DictConfig) -> None:
     if sys.platform == "win32" and not use_binary:
         prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
 
+    # Helper to access underlying model (unwrap DDP if needed)
+    def get_moco():
+        return model.module if dist_ctx.enabled else model
+
     # Training loop
     global_step = start_epoch * (num_batches // grad_accum)
     optimizer.zero_grad(set_to_none=True)
@@ -240,14 +278,15 @@ def cmd_train(cfg: DictConfig) -> None:
         p_digi = curriculum_p_digiface(epoch, curriculum)
         p_pseudo = get_pseudo_prob(epoch, pseudo_sched) if pseudo_enabled else 0.0
 
-        # Pseudo-ID refresh
+        # Pseudo-ID refresh (all ranks participate, but only main logs)
         if pseudo_mgr and epoch in refresh_epochs:
             datasets = [digiface_ds] + ([digi2real_ds] if digi2real_ds else [])
-            stats = pseudo_mgr.refresh(model, datasets, epoch, pseudo_mgr.get_threshold(), device, batch_size, num_workers)
-            if wandb_active:
+            moco = get_moco()
+            stats = pseudo_mgr.refresh(moco, datasets, epoch, pseudo_mgr.get_threshold(), device, batch_size, num_workers)
+            if wandb_active and dist_ctx.is_main:
                 log_wandb(stats, step=global_step)
             if reset_queue:
-                model.reset_queue()
+                moco.reset_queue()
 
         # Build epoch dataset
         if use_binary:
@@ -278,7 +317,8 @@ def cmd_train(cfg: DictConfig) -> None:
         epoch_start = time.perf_counter()
         img_count = 0
 
-        pbar = tqdm(loader, total=num_batches, desc=f"Epoch {epoch:03d} [{_get_phase(epoch)}]", unit="batch")
+        pbar = tqdm(loader, total=num_batches, desc=f"Epoch {epoch:03d} [{_get_phase(epoch)}]", unit="batch",
+                    disable=not dist_ctx.is_main)  # Only show progress on main process
         for step, batch in enumerate(pbar):
             # Unpack batch
             if use_pseudo and len(batch) == 3:
@@ -307,7 +347,7 @@ def cmd_train(cfg: DictConfig) -> None:
                 else:
                     optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                model.update_momentum_encoder()
+                get_moco().update_momentum_encoder()
                 global_step += 1
 
             # Accumulate stats
@@ -319,8 +359,8 @@ def cmd_train(cfg: DictConfig) -> None:
                 grad_norm_sum += float(grad_norm)
             n_steps += 1
 
-            # Log to wandb
-            if wandb_active and log_every > 0 and global_step % log_every == 0 and (step + 1) % grad_accum == 0:
+            # Log to wandb (main process only)
+            if wandb_active and dist_ctx.is_main and log_every > 0 and global_step % log_every == 0 and (step + 1) % grad_accum == 0:
                 m = {"train/loss": stats["loss"], "train/pos_sim": stats["pos_sim"], "train/neg_sim": stats["neg_sim"],
                      "train/sim_gap": stats["pos_sim"] - stats["neg_sim"], "train/emb_std": stats["emb_std"],
                      "train/grad_norm": float(grad_norm), "train/lr": lr, "train/epoch": epoch, "train/p_digiface": p_digi}
@@ -334,13 +374,15 @@ def cmd_train(cfg: DictConfig) -> None:
             avg_ips = img_count / (now - epoch_start) if now > epoch_start else 0
             pbar.set_postfix(loss=f"{stats['loss']:.4f}", pos=f"{stats['pos_sim']:.3f}", neg=f"{stats['neg_sim']:.3f}", ips=f"{avg_ips:.0f}")
 
-        # Epoch summary
+        # Epoch summary (main process only for logging)
         elapsed = time.perf_counter() - epoch_start
         if n_steps > 0:
             avg_loss, avg_pos, avg_neg = loss_sum/n_steps, pos_sum/n_steps, neg_sum/n_steps
-            gap, ips = avg_pos - avg_neg, img_count / elapsed
+            # For DDP, multiply ips by world_size (each GPU processes batch_size images)
+            ips = img_count / elapsed * dist_ctx.world_size
+            gap = avg_pos - avg_neg
 
-            if wandb_active:
+            if wandb_active and dist_ctx.is_main:
                 num_opt_steps = n_steps // grad_accum
                 em = {"epoch/loss": avg_loss, "epoch/pos_sim": avg_pos, "epoch/neg_sim": avg_neg, "epoch/sim_gap": gap,
                       "epoch/emb_std": std_sum/n_steps, "epoch/grad_norm": grad_norm_sum/num_opt_steps if num_opt_steps > 0 else 0,
@@ -350,13 +392,16 @@ def cmd_train(cfg: DictConfig) -> None:
                 em.update(log_gpu_memory())
                 log_wandb(em, step=global_step)
 
-            done = epoch - start_epoch + 1
-            eta = _fmt_time((time.perf_counter() - train_start) / done * (epochs - epoch - 1))
-            logger.info(f"Epoch {epoch:03d} | loss={avg_loss:.4f} pos={avg_pos:.3f} neg={avg_neg:.3f} gap={gap:.3f} | {ips:.0f} ips | ETA: {eta}")
+            if dist_ctx.is_main:
+                done = epoch - start_epoch + 1
+                eta = _fmt_time((time.perf_counter() - train_start) / done * (epochs - epoch - 1))
+                logger.info(f"Epoch {epoch:03d} | loss={avg_loss:.4f} pos={avg_pos:.3f} neg={avg_neg:.3f} gap={gap:.3f} | {ips:.0f} ips | ETA: {eta}")
 
-        # Checkpoint
-        if (epoch + 1) % save_every == 0 or epoch + 1 == epochs:
-            path = save_checkpoint(out_dir, epoch=epoch+1, model=model, optimizer=optimizer, scaler=scaler, cfg=cfg, pseudo_manager=pseudo_mgr)
+        # Checkpoint (main process only)
+        if dist_ctx.is_main and ((epoch + 1) % save_every == 0 or epoch + 1 == epochs):
+            # For DDP, save the underlying model (unwrap DDP wrapper)
+            save_model = get_moco()
+            path = save_checkpoint(out_dir, epoch=epoch+1, model=save_model, optimizer=optimizer, scaler=scaler, cfg=cfg, pseudo_manager=pseudo_mgr)
 
             # Upload to W&B with retry
             upload_success = False
@@ -395,10 +440,18 @@ def cmd_train(cfg: DictConfig) -> None:
             else:
                 path.unlink(missing_ok=True)  # Delete only after confirmed upload
 
+        # Synchronize all ranks after checkpoint (ensures all wait for main to finish saving/uploading)
+        if dist_ctx.enabled:
+            dist.barrier()
+
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
     # Done
-    total = _fmt_time(time.perf_counter() - train_start)
-    logger.info(f"\n{'='*70}\n  Training complete in {total}\n  Checkpoints: {out_dir/'checkpoints'}\n{'='*70}\n")
-    finish_wandb()
+    if dist_ctx.is_main:
+        total = _fmt_time(time.perf_counter() - train_start)
+        logger.info(f"\n{'='*70}\n  Training complete in {total}\n  Checkpoints: {out_dir/'checkpoints'}\n{'='*70}\n")
+        finish_wandb()
+
+    # Clean up distributed
+    cleanup_distributed()
