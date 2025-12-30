@@ -276,8 +276,7 @@ def cmd_train(cfg: DictConfig) -> None:
         n_steps = 0
         grad_norm = 0.0
         epoch_start = time.perf_counter()
-        img_count = last_img = 0
-        last_time = epoch_start
+        img_count = 0
 
         pbar = tqdm(loader, total=num_batches, desc=f"Epoch {epoch:03d} [{_get_phase(epoch)}]", unit="batch")
         for step, batch in enumerate(pbar):
@@ -330,14 +329,10 @@ def cmd_train(cfg: DictConfig) -> None:
                 m.update(log_gpu_memory())
                 log_wandb(m, step=global_step)
 
-            # Update progress bar with instantaneous img/s
+            # Update progress bar with avg img/s
             now = time.perf_counter()
-            if now - last_time >= 1.0:
-                ips = (img_count - last_img) / (now - last_time)
-                last_time, last_img = now, img_count
-            else:
-                ips = img_count / (now - epoch_start) if now > epoch_start else 0
-            pbar.set_postfix(loss=f"{stats['loss']:.4f}", pos=f"{stats['pos_sim']:.3f}", neg=f"{stats['neg_sim']:.3f}", ips=f"{ips:.0f}")
+            avg_ips = img_count / (now - epoch_start) if now > epoch_start else 0
+            pbar.set_postfix(loss=f"{stats['loss']:.4f}", pos=f"{stats['pos_sim']:.3f}", neg=f"{stats['neg_sim']:.3f}", ips=f"{avg_ips:.0f}")
 
         # Epoch summary
         elapsed = time.perf_counter() - epoch_start
