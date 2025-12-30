@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Any
 
 import torch
-import wandb
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
+import wandb
 from src import data
 
 logger = logging.getLogger(__name__)
