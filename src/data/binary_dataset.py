@@ -11,7 +11,6 @@ import torch
 from torch.utils.data import IterableDataset
 
 from src.data.worker_utils import _global_worker_info
-from src.utils.platform import is_windows
 
 logger = logging.getLogger(__name__)
 
@@ -53,22 +52,19 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
                 f"Binary cache not found: {self.npy_path}\nRun: python fast_convert.py"
             )
 
-        # Load array - use mmap on Windows (spawn), direct load on Unix (fork COW)
-        logger.info(f"Loading binary cache: {self.npy_path}")
-        if is_windows():
-            self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode="r")
-        else:
-            self.images = np.load(str(self.npy_path))
+        # Use mmap on ALL platforms - instant load, zero copy
+        logger.info(f"Loading binary cache (mmap): {self.npy_path}")
+        self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode="r")
 
         if self.images.ndim != 4 or self.images.shape[3] != 3:
             raise ValueError(f"Expected (N, H, W, 3), got {self.images.shape}")
 
-        if not is_windows() and not self.images.flags["C_CONTIGUOUS"]:
-            logger.warning("Making array contiguous...")
-            self.images = np.ascontiguousarray(self.images)
-
+        # Log size (virtual memory, not actual RAM usage)
         self._num_images = len(self.images)
-        logger.info(f"Loaded {self._num_images:,} images, {self.images.nbytes / 1e9:.1f} GB")
+        size_gb = (self._num_images * self.images.shape[1] * self.images.shape[2] * 3) / 1e9
+        logger.info(f"Loaded {self._num_images:,} images, {size_gb:.1f} GB (Virtual)")
+
+        # Skip contiguous check - mmap arrays are read-only views, can't modify
 
     def __len__(self) -> int:
         return self._num_images
