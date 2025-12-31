@@ -34,10 +34,11 @@ name = "pytorch-cu124"
 url = "https://download.pytorch.org/whl/cu124"
 explicit = true
 
-# PyTorch CUDA 12.8 (Blackwell - RTX 5090, PRO 6000)
+# PyTorch CUDA 12.8 Nightly (Blackwell - RTX 5090, PRO 6000)
+# Nightly builds include sm_120 support for Blackwell GPUs
 [[tool.uv.index]]
 name = "pytorch-cu128"
-url = "https://download.pytorch.org/whl/cu128"
+url = "https://download.pytorch.org/whl/nightly/cu128"
 explicit = true
 
 [tool.uv.sources]
