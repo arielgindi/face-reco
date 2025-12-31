@@ -194,9 +194,8 @@ def _setup_training(
     if not binary_cache or not Path(binary_cache).exists():
         raise ValueError("Binary cache required: data.binary_cache_path")
 
-    seed = int(cfg.get("experiment", {}).get("seed", 42))
-    digiface_ds = data.BinaryImageDataset(binary_cache, None, None, seed=seed)
-    base_samples = len(digiface_ds)
+    # Get dataset length without loading full array (avoid duplicate load)
+    base_samples = data.get_binary_dataset_length(binary_cache)
 
     num_batches, _ = compute_epoch_batch_counts(
         base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
