@@ -16,6 +16,17 @@ from src.utils.platform import is_windows
 logger = logging.getLogger(__name__)
 
 
+def get_binary_dataset_length(npy_path: str | Path) -> int:
+    """Get dataset length without loading the full array into memory."""
+    npy_path = Path(npy_path)
+    if not npy_path.exists():
+        raise FileNotFoundError(f"Binary cache not found: {npy_path}")
+
+    # Use mmap to read just the header (shape info)
+    arr = np.load(str(npy_path), mmap_mode="r")
+    return len(arr)
+
+
 class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
     """Ultra-fast dataset loading pre-decoded images from .npy file (N, H, W, 3) uint8."""
 
