@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import pickle
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -74,7 +75,14 @@ def load_checkpoint_for_resume(
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
 
-    ckpt = torch.load(path, map_location=device, weights_only=True)
+    # Try secure loading first, fallback to unsafe for old checkpoints
+    try:
+        ckpt = torch.load(path, map_location=device, weights_only=True)
+    except (pickle.UnpicklingError, RuntimeError) as e:
+        logger.warning(
+            f"Checkpoint uses unsafe pickle format. Loading with weights_only=False. Error: {e}"
+        )
+        ckpt = torch.load(path, map_location=device, weights_only=False)
     ckpt_epoch = int(ckpt.get("epoch", 0))
     ckpt_state = _filter_warm_start_state(ckpt["model"]) if warm_start else ckpt["model"]
 

@@ -57,6 +57,9 @@ wandb:
 # No parquet support - all data must be converted to binary cache first
 # Use fast_convert.py to convert parquet files to binary format
 data:
+  # Path to binary cache file (pre-decoded images in .npy format)
+  binary_cache_path: "data/images.npy"
+
   # Dataset splitting configuration
   split:
     train_ratio: 0.75  # Fraction of data for training (0.75 = 75% train, 25% test)
