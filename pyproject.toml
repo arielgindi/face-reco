@@ -8,7 +8,7 @@ dependencies = [
   "numpy",
   "pyyaml",
   "tqdm",
-  "faiss-cpu",
+  "faiss-gpu; python_version == '3.10'",
   "pillow",
   "wandb",
   "hydra-core",

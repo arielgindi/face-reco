@@ -11,9 +11,11 @@ def is_windows() -> bool:
 
 
 def get_optimal_batch_size(*, base_size: int, windows_multiplier: float = 0.25) -> int:
-    """Get platform-optimized batch size (Windows gets reduced due to spawn)."""
-    if is_windows():
-        return int(base_size * windows_multiplier)
+    """Get platform-optimized batch size.
+
+    Note: mmap block shuffling eliminates Windows memory pressure penalty.
+    Returns base_size on all platforms.
+    """
     return base_size
 
 

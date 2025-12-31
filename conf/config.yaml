@@ -147,8 +147,8 @@ pseudo:
   # -------------------------------------------------------------------------
   embed:
     # Base batch size for embedding extraction (platform-optimized automatically)
-    batch_size_base: 2048       # Reduced from 8192 to prevent OOM on smaller GPUs
-                                # Windows automatically gets 25% (512) due to mmap memory pressure
+    batch_size_base: 8192       # Optimal for high-end GPUs (RTX 4090/5090 with 24GB+ VRAM)
+                                # Reduced automatically on Windows if needed
                                 # Unix uses fork with copy-on-write, can use larger batches
 
     # Embedding batch/worker multipliers (for pseudo-ID refresh)
