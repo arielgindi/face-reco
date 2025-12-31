@@ -8,45 +8,16 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.utils.data import IterableDataset, get_worker_info
+from torch.utils.data import IterableDataset
+
+from src.data.worker_utils import _global_worker_info
+from src.utils.platform import is_windows
 
 logger = logging.getLogger(__name__)
 
 
-def _global_worker_info() -> tuple[int, int]:
-    """Get global (worker_id, total_workers) across DDP ranks + DataLoader workers."""
-    info = get_worker_info()
-    wid, nw = (0, 1) if info is None else (info.id, info.num_workers)
-
-    if dist.is_initialized():
-        rank, world_size = dist.get_rank(), dist.get_world_size()
-    else:
-        rank, world_size = 0, 1
-
-    total = world_size * nw
-    gid = rank * nw + wid
-    return gid, total
-
-
 class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
-    """
-    Ultra-fast dataset loading pre-decoded images from .npy file.
-
-    Design:
-    - Loads ENTIRE array into RAM in __init__ (main process)
-    - Uses fork() workers for copy-on-write memory sharing (zero duplication)
-    - Applies albumentations (OpenCV backend) for max speed
-    - Infinite iteration with per-epoch shuffling
-
-    Expected .npy format: shape (N, H, W, 3), dtype uint8
-
-    Args:
-        npy_path: Path to .npy file with pre-decoded images
-        transform_q: Albumentations Compose for query view
-        transform_k: Albumentations Compose for key view
-        seed: Random seed for shuffling
-    """
+    """Ultra-fast dataset loading pre-decoded images from .npy file (N, H, W, 3) uint8."""
 
     def __init__(
         self,
@@ -55,35 +26,33 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         transform_k,  # A.Compose
         *,
         seed: int = 42,
+        block_size: int = 8192,
+        worker_seed_offset: int = 7919,
     ) -> None:
         super().__init__()
         self.npy_path = Path(npy_path)
         self.transform_q = transform_q
         self.transform_k = transform_k
         self.seed = seed
+        self.block_size = block_size
+        self.worker_seed_offset = worker_seed_offset
 
         if not self.npy_path.exists():
             raise FileNotFoundError(
-                f"Binary cache not found: {self.npy_path}\n"
-                f"Run: python fast_convert.py"
+                f"Binary cache not found: {self.npy_path}\nRun: python fast_convert.py"
             )
 
         # Load array - use mmap on Windows (spawn), direct load on Unix (fork COW)
-        import sys
         logger.info(f"Loading binary cache: {self.npy_path}")
-        if sys.platform == "win32":
-            # Windows uses spawn - each worker would reload entire array
-            # Use memory-mapping for true zero-copy shared access
-            self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode='r')
+        if is_windows():
+            self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode="r")
         else:
-            # Unix fork() gives COW - load once, workers share via page tables
             self.images = np.load(str(self.npy_path))
 
         if self.images.ndim != 4 or self.images.shape[3] != 3:
             raise ValueError(f"Expected (N, H, W, 3), got {self.images.shape}")
 
-        # Skip contiguity check for mmap (read-only, handled by OS)
-        if sys.platform != "win32" and not self.images.flags['C_CONTIGUOUS']:
+        if not is_windows() and not self.images.flags["C_CONTIGUOUS"]:
             logger.warning("Making array contiguous...")
             self.images = np.ascontiguousarray(self.images)
 
@@ -106,18 +75,17 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         my_indices = np.arange(start, end, dtype=np.int64)
 
         # Per-worker RNG (unique across all ranks + workers)
-        rng = np.random.default_rng(self.seed + gid * 7919)
+        rng = np.random.default_rng(self.seed + gid * self.worker_seed_offset)
 
         # Block shuffle: keeps IO mostly sequential
-        BLOCK = 8192
         epoch = 0
         while True:
             # Shuffle blocks, not individual indices
-            blocks = np.arange(0, len(my_indices), BLOCK, dtype=np.int64)
+            blocks = np.arange(0, len(my_indices), self.block_size, dtype=np.int64)
             rng.shuffle(blocks)
 
             for b in blocks:
-                block = my_indices[b : b + BLOCK].copy()
+                block = my_indices[b : b + self.block_size].copy()
                 # Light shuffle within block (still local/sequential-ish)
                 rng.shuffle(block)
 
@@ -129,18 +97,15 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
                         view_q = self.transform_q(image=img)["image"]
                         view_k = self.transform_k(image=img)["image"]
                         yield view_q, view_k
-                    except Exception:
+                    except (KeyError, ValueError, TypeError) as e:
+                        logger.debug(f"Transform failed for image {idx}: {e}")
                         continue
 
             epoch += 1
 
 
 class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
-    """
-    Curriculum mix of BinaryImageDataset (like CurriculumMixTwoViewDataset).
-
-    Mixes two datasets with probability p_a for dataset_a.
-    """
+    """Curriculum mix of BinaryImageDataset with probability p_a for dataset_a."""
 
     def __init__(
         self,
@@ -149,6 +114,7 @@ class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         p_a: float,
         num_samples: int,
         seed: int,
+        worker_seed_offset: int = 7919,
     ) -> None:
         super().__init__()
         self.dataset_a = dataset_a
@@ -156,6 +122,7 @@ class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         self.p_a = float(p_a)
         self.num_samples = num_samples
         self.seed = seed
+        self.worker_seed_offset = worker_seed_offset
 
     def __len__(self) -> int:
         return self.num_samples
@@ -164,7 +131,7 @@ class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
         gid, total = _global_worker_info()
 
         target = self.num_samples // total + (1 if gid < self.num_samples % total else 0)
-        rng = np.random.default_rng(self.seed + gid * 7919)
+        rng = np.random.default_rng(self.seed + gid * self.worker_seed_offset)
 
         it_a = iter(self.dataset_a)
         it_b = iter(self.dataset_b) if self.dataset_b else None
@@ -180,3 +147,89 @@ class BinaryMixDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
 
             yield sample
             produced += 1
+
+
+class PseudoPairTwoViewDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
+    """Wraps a base dataset and samples pseudo-ID pairs with probability p_pseudo."""
+
+    def __init__(
+        self,
+        base_dataset: BinaryImageDataset | BinaryMixDataset,
+        pseudo_manager,
+        transform_q,
+        transform_k,
+        p_pseudo: float,
+        num_samples: int,
+        seed: int,
+        worker_seed_offset: int = 7919,
+    ) -> None:
+        super().__init__()
+        self.base_dataset = base_dataset
+        self.pseudo_manager = pseudo_manager
+        self.transform_q = transform_q
+        self.transform_k = transform_k
+        self.p_pseudo = float(p_pseudo)
+        self.num_samples = num_samples
+        self.seed = seed
+        self.worker_seed_offset = worker_seed_offset
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
+        gid, total = _global_worker_info()
+
+        target = self.num_samples // total + (1 if gid < self.num_samples % total else 0)
+        rng = np.random.default_rng(self.seed + gid * self.worker_seed_offset)
+
+        it_base = iter(self.base_dataset)
+        produced = 0
+
+        # Get base dataset images for pseudo-ID sampling
+        if hasattr(self.base_dataset, "dataset_a") and hasattr(
+            self.base_dataset.dataset_a, "images"
+        ):
+            base_images = self.base_dataset.dataset_a.images
+        elif hasattr(self.base_dataset, "images"):
+            base_images = self.base_dataset.images
+        else:
+            raise ValueError("Cannot access images from base_dataset")
+
+        while produced < target:
+            # With probability p_pseudo, sample a pseudo-ID pair
+            if (
+                self.pseudo_manager
+                and self.pseudo_manager.state is not None
+                and rng.random() < self.p_pseudo
+            ):
+                # Sample random image index
+                img_idx = rng.integers(0, len(base_images))
+
+                # Try to get pseudo-ID partner
+                partner_idx = self.pseudo_manager.state.sample_partner(img_idx, rng)
+
+                if partner_idx is not None:
+                    # Apply transforms to both images
+                    img_q = base_images[img_idx]
+                    img_k = base_images[partner_idx]
+
+                    try:
+                        view_q = self.transform_q(image=img_q)["image"]
+                        view_k = self.transform_k(image=img_k)["image"]
+                        yield view_q, view_k
+                        produced += 1
+                        continue
+                    except (KeyError, ValueError, TypeError) as e:
+                        logger.debug(
+                            f"Transform failed for pseudo pair ({img_idx}, {partner_idx}): {e}"
+                        )
+
+            # Fall back to base dataset
+            try:
+                yield next(it_base)
+                produced += 1
+            except StopIteration:
+                # Restart base iterator if we run out
+                it_base = iter(self.base_dataset)
+                yield next(it_base)
+                produced += 1

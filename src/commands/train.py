@@ -4,11 +4,10 @@ from __future__ import annotations
 
 import logging
 import os
-import shutil
-import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -20,22 +19,19 @@ from tqdm import tqdm
 
 import wandb
 from src import data
-from src.augmentations import build_album_transform, build_view_transform
+from src.augmentations import build_album_transform
 from src.checkpoint import (
     find_latest_checkpoint,
     load_checkpoint_for_resume,
-    prewarm_datasets,
     prune_checkpoints,
     save_checkpoint,
 )
 from src.model import build_moco
 from src.pseudo import PseudoIDManager
 from src.schedule import (
-    build_curriculum_schedule,
     build_pseudo_schedule,
-    curriculum_p_digiface,
     get_pseudo_prob,
-    get_refresh_epochs,
+    should_refresh_pseudo,
 )
 from src.utils import (
     DistributedContext,
@@ -44,6 +40,10 @@ from src.utils import (
     configure_precision,
     set_seed,
     setup_distributed,
+)
+from src.utils.platform import (
+    supports_fork,
+    supports_torch_compile,
 )
 from src.wandb_utils import finish_wandb, init_wandb, log_gpu_memory, log_wandb
 
@@ -55,50 +55,8 @@ def _fmt_time(s: float) -> str:
     if s < 60:
         return f"{s:.0f}s"
     if s < 3600:
-        return f"{s/60:.1f}m"
-    return f"{int(s//3600)}h {int((s%3600)//60)}m"
-
-
-def _log_config(cfg: DictConfig, dist_ctx: DistributedContext, num_params: int,
-                n_ids: int, n_samples: int, n_batches: int, start: int) -> None:
-    """Log training configuration summary (main process only)."""
-    if not dist_ctx.is_main:
-        return
-
-    ssl, pseudo, train = cfg.get("ssl", {}), cfg.get("pseudo", {}), cfg.train
-    device = dist_ctx.device
-    gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
-    mem = f"{torch.cuda.get_device_properties(device).total_memory/1e9:.1f}GB" if device.type == "cuda" else ""
-
-    logger.info("\n" + "="*70)
-    logger.info("  SNIPERFACE TRAINING")
-    logger.info("="*70)
-
-    # Show distributed info
-    if dist_ctx.enabled:
-        logger.info(f"  Distributed: {dist_ctx.world_size} GPUs (NCCL)")
-    logger.info(f"  GPU: {gpu} ({mem})  |  Precision: {'FP16' if train.precision.amp else 'FP32'}")
-    logger.info(f"  Model: {cfg.model.backbone.name} ({num_params:,} params, {cfg.model.backbone.embedding_dim}D)")
-    logger.info(f"  SSL: queue={ssl.get('queue_size',32768):,} temp={ssl.get('temperature',0.07)} margin={ssl.get('margin_nce',{}).get('margin',0.1)}")
-
-    # Show effective batch size for DDP
-    batch_per_gpu = train.batch.size
-    effective_batch = batch_per_gpu * dist_ctx.world_size * train.batch.grad_accum_steps
-    logger.info(f"  Training: epochs {start}->{train.epochs-1} | batch {batch_per_gpu}x{dist_ctx.world_size}x{train.batch.grad_accum_steps}={effective_batch} | lr={train.optimizer.lr}")
-    logger.info(f"  Data: {n_ids:,} identities | {n_samples:,} samples/epoch | {n_batches//train.batch.grad_accum_steps:,} steps")
-    if pseudo.get("enabled"):
-        th = pseudo.get("sim_threshold", {})
-        logger.info(f"  Pseudo-ID: k={pseudo.get('knn_k',20)} mutual={pseudo.get('mutual_topk',5)} threshold={th.get('start',0.72)}->{th.get('end',0.52)}")
-    logger.info("="*70 + "\n")
-
-
-def _get_phase(epoch: int) -> str:
-    """Get training phase name for display."""
-    if epoch < 5:
-        return "A:Stabilize"
-    if epoch < 35:
-        return "B:Bootstrap"
-    return "C:Refine"
+        return f"{s / 60:.1f}m"
+    return f"{int(s // 3600)}h {int((s % 3600) // 60)}m"
 
 
 def _build_lr_fn(cfg: DictConfig) -> Callable[[int], float]:
@@ -114,7 +72,233 @@ def _build_lr_fn(cfg: DictConfig) -> Callable[[int], float]:
         if warm_enabled and epoch < warm_epochs and warm_epochs > 1:
             return warm_start_lr + (epoch / (warm_epochs - 1)) * (lr - warm_start_lr)
         return lr
+
     return lr_for_epoch
+
+
+def _setup_training(
+    cfg: DictConfig, dist_ctx: DistributedContext, out_dir: Path
+) -> tuple[Any, SGD, Any, PseudoIDManager | None, int, int]:
+    """Setup training components: model, optimizer, scaler, pseudo-ID manager, and resume checkpoint.
+
+    Returns:
+        Tuple of (model, optimizer, scaler, pseudo_manager, start_epoch, global_step)
+    """
+    device = dist_ctx.device
+
+    # Model & optimizer
+    model = build_moco(cfg, device=device)
+    model.train()
+    batch_size, grad_accum = (
+        int(cfg.train.batch.size),
+        int(cfg.train.batch.grad_accum_steps),
+    )
+
+    # Validate queue_size compatibility with DDP settings
+    queue_size = (
+        model.cfg.queue_size
+        if not dist_ctx.enabled
+        else model.module.cfg.queue_size
+        if hasattr(model, "module")
+        else model.cfg.queue_size
+    )
+    effective_batch = batch_size * dist_ctx.world_size
+    if queue_size % effective_batch != 0 and dist_ctx.is_main:
+        logger.warning(
+            f"Queue size ({queue_size}) is not divisible by effective batch size ({effective_batch} = {batch_size}*{dist_ctx.world_size}). "
+            f"This may cause queue pointer drift across epochs in DDP mode."
+        )
+
+    opt_cfg = cfg.train.optimizer
+    optimizer = SGD(
+        model.parameters(),
+        lr=float(opt_cfg.lr),
+        momentum=float(opt_cfg.momentum),
+        weight_decay=float(opt_cfg.weight_decay),
+        nesterov=bool(opt_cfg.nesterov),
+    )
+
+    # Setup AMP scaler
+    amp_enabled, amp_dtype, _ = configure_precision(cfg)
+    scaler = (
+        torch.amp.GradScaler("cuda")
+        if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16
+        else None
+    )
+
+    # Pseudo-ID manager
+    pseudo_cfg = cfg.get("pseudo", {})
+    pseudo_enabled = bool(pseudo_cfg.get("enabled", False))
+    if pseudo_enabled:
+        embed_cfg = pseudo_cfg.embed
+        pseudo_mgr = PseudoIDManager(
+            knn_k=int(pseudo_cfg.knn_k),
+            mutual_topk=int(pseudo_cfg.mutual_topk),
+            min_cluster_size=int(pseudo_cfg.min_cluster_size),
+            max_cluster_size=int(pseudo_cfg.max_cluster_size),
+            sim_threshold=float(pseudo_cfg.get("sim_threshold", 0.60)),
+            batch_size_base=int(embed_cfg.batch_size_base),
+            embed_batch_multiplier=int(embed_cfg.embed_batch_multiplier),
+            embed_workers_multiplier=int(embed_cfg.embed_workers_multiplier),
+            rejection_sampling_tries=int(embed_cfg.rejection_sampling_tries),
+            faiss_temp_memory_gb=int(embed_cfg.faiss_temp_memory_gb),
+            faiss_nprobe=int(embed_cfg.get("faiss_nprobe", 64)),
+        )
+    else:
+        pseudo_mgr = None
+
+    # Resume checkpoint
+    start_epoch = 0
+    resume = cfg.train.get("resume", "auto")
+    if resume:
+        if resume == "auto":
+            # Find latest from W&B or local
+            wandb_project = cfg.get("wandb", {}).get("project", "")
+            resume_path = find_latest_checkpoint(wandb_project, out_dir / "checkpoints")
+        else:
+            resume_path = Path(resume)
+        start_epoch = load_checkpoint_for_resume(
+            resume_path,
+            model,
+            optimizer,
+            scaler,
+            device,
+            pseudo_manager=pseudo_mgr,
+            warm_start=bool(cfg.train.get("warm_start", False)),
+        )
+
+    # Wrap in DDP if distributed (before torch.compile)
+    if dist_ctx.enabled:
+        model = DDP(model, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank)
+        if dist_ctx.is_main:
+            logger.info(f"Wrapped model in DDP ({dist_ctx.world_size} GPUs)")
+
+    # Torch compile (Unix only, after DDP wrap)
+    if (
+        device.type == "cuda"
+        and supports_torch_compile()
+        and cfg.train.precision.get("torch_compile")
+    ):
+        torch._dynamo.config.capture_scalar_outputs = True
+        cc = torch.cuda.get_device_capability(device)
+        if cc[0] >= 12:  # Blackwell (sm_120) - use cudagraphs backend (Triton has issues)
+            if dist_ctx.is_main:
+                logger.info(f"Using cudagraphs backend for Blackwell GPU (sm_{cc[0]}{cc[1]})")
+            model = torch.compile(model, backend="cudagraphs")
+        else:
+            model = torch.compile(model, mode="reduce-overhead")
+
+    # Compute global step from start epoch (binary mode only)
+    data_cfg = cfg.get("data", {})
+    binary_cache = data_cfg.get("binary_cache_path")
+    if not binary_cache or not Path(binary_cache).exists():
+        raise ValueError("Binary cache required: data.binary_cache_path")
+
+    seed = int(cfg.get("experiment", {}).get("seed", 42))
+    digiface_ds = data.BinaryImageDataset(binary_cache, None, None, seed=seed)
+    base_samples = len(digiface_ds)
+
+    num_batches, _ = compute_epoch_batch_counts(
+        base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
+    )
+    global_step = start_epoch * (num_batches // grad_accum)
+
+    return model, optimizer, scaler, pseudo_mgr, start_epoch, global_step
+
+
+def _save_checkpoint(
+    cfg: DictConfig,
+    out_dir: Path,
+    epoch: int,
+    model: Any,
+    optimizer: SGD,
+    scaler: Any,
+    pseudo_mgr: PseudoIDManager | None,
+    wandb_active: bool,
+    save_local: bool,
+    keep_last: int,
+) -> None:
+    """Save checkpoint and optionally upload to wandb."""
+    path = save_checkpoint(
+        out_dir,
+        epoch=epoch + 1,
+        model=model,
+        optimizer=optimizer,
+        scaler=scaler,
+        cfg=cfg,
+        pseudo_manager=pseudo_mgr,
+    )
+
+    # Upload to W&B with retry
+    upload_success = False
+    if wandb_active and cfg.get("wandb", {}).get("save_artifacts"):
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch + 1})
+                art.add_file(str(path))
+                wandb.log_artifact(art, aliases=["latest"])
+                # Wait for upload with timeout (10 minutes)
+                art.wait(timeout=600)
+                upload_success = True
+                logger.info(f"Uploaded: {path.name}")
+                break
+            except wandb.errors.CommError as e:
+                # Network errors - retry with exponential backoff
+                wait_time = 5 * (2**attempt)  # 5s, 10s, 20s
+                logger.warning(
+                    f"Network error on attempt {attempt + 1}/{max_attempts}: {e}. Retrying in {wait_time}s..."
+                )
+                if attempt < max_attempts - 1:
+                    time.sleep(wait_time)
+            except (PermissionError, wandb.errors.AuthenticationError) as e:
+                # Auth errors - don't retry
+                logger.error(f"Authentication/permission error during upload: {e}")
+                break
+            except TimeoutError as e:
+                # Timeout - retry with exponential backoff
+                wait_time = 5 * (2**attempt)
+                logger.warning(
+                    f"Timeout on attempt {attempt + 1}/{max_attempts}: {e}. Retrying in {wait_time}s..."
+                )
+                if attempt < max_attempts - 1:
+                    time.sleep(wait_time)
+            except OSError as e:
+                # File I/O errors - don't retry
+                logger.error(f"File I/O error during upload: {e}")
+                break
+
+        if not upload_success:
+            logger.error(
+                f"Failed to upload {path.name} after {max_attempts} attempts - keeping local copy"
+            )
+
+        # Prune old artifact versions, keep last 5
+        if upload_success:
+            try:
+                api = wandb.Api()
+                collection = api.artifact_collection(
+                    "model", f"{wandb.run.entity}/{wandb.run.project}/checkpoint"
+                )
+                versions = sorted(
+                    collection.versions(),
+                    key=lambda a: int(a.version.lstrip("v")),
+                    reverse=True,
+                )
+                for old in versions[5:]:
+                    old.delete()
+            except (wandb.errors.CommError, ValueError, KeyError) as e:
+                logger.warning(f"Failed to prune old artifact versions: {e}")
+            except Exception as e:
+                # Catch unexpected errors to prevent training crash
+                logger.warning(f"Unexpected error during artifact cleanup: {e}")
+
+    # Handle local storage - keep if upload failed
+    if save_local or not upload_success:
+        prune_checkpoints(out_dir / "checkpoints", keep_last)
+        logger.info(f"Saved locally: {path.name}")
+    else:
+        path.unlink(missing_ok=True)  # Delete only after confirmed upload
 
 
 def cmd_train(cfg: DictConfig) -> None:
@@ -135,132 +319,85 @@ def cmd_train(cfg: DictConfig) -> None:
     wandb_active = init_wandb(cfg, out_dir) if dist_ctx.is_main else False
     log_every = int(cfg.get("wandb", {}).get("log_every_steps", 50))
 
-    # Data splits
+    # Data configuration (binary mode only)
     data_cfg = cfg.get("data", {})
-    digiface_glob, digi2real_glob = data_cfg.get("digiface_glob"), data_cfg.get("digi2real_glob")
-    if not digiface_glob:
-        raise ValueError("data.digiface_glob not specified")
 
-    split_cfg = data_cfg.get("split", {})
-    globs = [digiface_glob] + ([digi2real_glob] if digi2real_glob else [])
-    splits_path = data.get_or_create_splits(
-        globs=globs, cache_dir=Path(split_cfg.get("cache_dir", ".cache/splits")),
-        train_ratio=float(split_cfg.get("train_ratio", 0.75)), seed=int(split_cfg.get("seed", seed)),
+    # Setup training components
+    model, optimizer, scaler, pseudo_mgr, start_epoch, global_step = _setup_training(
+        cfg, dist_ctx, out_dir
     )
-    train_ids = data.get_identity_set(splits_path, "train")
-    if dist_ctx.is_main:
-        shutil.copy2(splits_path, out_dir / "identity_splits.parquet")
+    num_params = sum(p.numel() for p in (model.module if dist_ctx.enabled else model).parameters())
+    batch_size, grad_accum, epochs = (
+        int(cfg.train.batch.size),
+        int(cfg.train.batch.grad_accum_steps),
+        int(cfg.train.epochs),
+    )
 
-    # Model & optimizer
-    model = build_moco(cfg, device=device)
-    model.train()
-    num_params = sum(p.numel() for p in model.parameters())
-    batch_size, grad_accum, epochs = int(cfg.train.batch.size), int(cfg.train.batch.grad_accum_steps), int(cfg.train.epochs)
-
-    opt_cfg = cfg.train.optimizer
-    optimizer = SGD(model.parameters(), lr=float(opt_cfg.lr), momentum=float(opt_cfg.momentum),
-                    weight_decay=float(opt_cfg.weight_decay), nesterov=bool(opt_cfg.nesterov))
-    scaler = torch.amp.GradScaler("cuda") if amp_enabled and device.type == "cuda" and amp_dtype == torch.float16 else None
-
-    # Pseudo-ID manager
+    # Pseudo-ID configuration
     pseudo_cfg = cfg.get("pseudo", {})
     pseudo_enabled = bool(pseudo_cfg.get("enabled", False))
-    if pseudo_enabled:
-        threshold_cfg = pseudo_cfg.sim_threshold
-        pseudo_mgr = PseudoIDManager(
-            knn_k=int(pseudo_cfg.knn_k),
-            mutual_topk=int(pseudo_cfg.mutual_topk),
-            min_cluster_size=int(pseudo_cfg.min_cluster_size),
-            max_cluster_size=int(pseudo_cfg.max_cluster_size),
-            threshold_start=float(threshold_cfg.start),
-            threshold_end=float(threshold_cfg.end),
-            target_coverage=float(threshold_cfg.target_coverage),
-            adaptation_rate=float(threshold_cfg.adaptation_rate),
-            adaptive_mode=str(threshold_cfg.mode).lower() == "adaptive",
-        )
-    else:
-        pseudo_mgr = None
 
-    # Resume checkpoint
-    start_epoch = 0
-    resume = cfg.train.get("resume", "auto")
-    if resume:
-        if resume == "auto":
-            # Find latest from W&B or local
-            wandb_project = cfg.get("wandb", {}).get("project", "")
-            resume_path = find_latest_checkpoint(wandb_project, out_dir / "checkpoints")
-        else:
-            resume_path = Path(resume)
-        start_epoch = load_checkpoint_for_resume(
-            resume_path, model, optimizer, scaler, device,
-            pseudo_manager=pseudo_mgr, warm_start=bool(cfg.train.get("warm_start", False)),
-        )
-
-    # Wrap in DDP if distributed (before torch.compile)
-    if dist_ctx.enabled:
-        model = DDP(model, device_ids=[dist_ctx.local_rank], output_device=dist_ctx.local_rank)
-        if dist_ctx.is_main:
-            logger.info(f"Wrapped model in DDP ({dist_ctx.world_size} GPUs)")
-
-    # Torch compile (Linux only, after DDP wrap)
-    if device.type == "cuda" and sys.platform != "win32" and cfg.train.precision.get("torch_compile"):
-        torch._dynamo.config.capture_scalar_outputs = True
-        cc = torch.cuda.get_device_capability(device)
-        if cc[0] >= 12:  # Blackwell (sm_120) - use cudagraphs backend (Triton has issues)
-            if dist_ctx.is_main:
-                logger.info(f"Using cudagraphs backend for Blackwell GPU (sm_{cc[0]}{cc[1]})")
-            model = torch.compile(model, backend="cudagraphs")
-        else:
-            model = torch.compile(model, mode="reduce-overhead")
-
-    # Datasets
-    input_size = tuple(cfg.model.backbone.input_size)
-    stream_cfg = data_cfg.get("streaming", {})
-    num_workers = int(stream_cfg.get("num_workers", 4))
-
-    # Check for binary cache (pre-decoded images for max speed)
+    # Binary dataset configuration
     binary_cache = data_cfg.get("binary_cache_path")
-    use_binary = binary_cache and Path(binary_cache).exists()
+    if not binary_cache or not Path(binary_cache).exists():
+        raise ValueError("Binary cache required: data.binary_cache_path")
 
-    if use_binary:
-        logger.info(f"Using binary cache: {binary_cache}")
-        t_q = build_album_transform(cfg.augmentation.view_1, input_size=input_size)
-        t_k = build_album_transform(cfg.augmentation.view_2, input_size=input_size)
-        digiface_ds = data.BinaryImageDataset(binary_cache, t_q, t_k, seed=seed)
-        digi2real_ds = None  # Binary mode uses single pre-merged dataset
-        base_samples = len(digiface_ds)
-    else:
-        t_q = build_view_transform(cfg.augmentation.view_1, input_size=input_size)
-        t_k = build_view_transform(cfg.augmentation.view_2, input_size=input_size)
-        stream = data.StreamParams(
-            shuffle_files=True, batch_read_rows=int(stream_cfg.get("batch_read_rows", 2048)),
-            shuffle_within_batch=True, shuffle_buffer_size=int(stream_cfg.get("shuffle_buffer_size", 10000)), seed=seed,
-        )
-        digiface_ds = data.ParquetTwoViewDataset(digiface_glob, t_q, t_k, stream=stream, allowed_identities=train_ids)
-        digi2real_ds = data.ParquetTwoViewDataset(digi2real_glob, t_q, t_k, stream=stream, allowed_identities=train_ids) if digi2real_glob else None
-        base_samples = int(cfg.train.get("samples_per_epoch", 0)) or data.count_parquet_rows(digiface_glob)
+    input_size = tuple(cfg.model.backbone.input_size)
+    num_workers = int(data_cfg.get("num_workers", 4))
+
+    logger.info(f"Using binary cache: {binary_cache}")
+    t_q = build_album_transform(cfg.augmentation.view_1, input_size=input_size)
+    t_k = build_album_transform(cfg.augmentation.view_2, input_size=input_size)
+    digiface_ds = data.BinaryImageDataset(binary_cache, t_q, t_k, seed=seed)
+    base_samples = len(digiface_ds)
 
     num_batches, num_samples = compute_epoch_batch_counts(
         base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
     )
 
     # Log config summary (main process only)
-    _log_config(cfg, dist_ctx, num_params, len(train_ids), num_samples, num_batches, start_epoch)
+    if dist_ctx.is_main:
+        pseudo, train = cfg.get("pseudo", {}), cfg.train
+        gpu = torch.cuda.get_device_name(device) if device.type == "cuda" else "CPU"
+
+        # Show distributed info
+        if dist_ctx.enabled:
+            logger.info(f"Distributed: {dist_ctx.world_size} GPUs | {gpu}")
+        else:
+            logger.info(f"Device: {gpu}")
+
+        logger.info(
+            f"Model: {cfg.model.backbone.name} ({num_params:,} params) | "
+            f"Precision: {'FP16' if train.precision.amp else 'FP32'}"
+        )
+
+        # Show effective batch size for DDP
+        batch_per_gpu = train.batch.size
+        effective_batch = batch_per_gpu * dist_ctx.world_size * train.batch.grad_accum_steps
+        logger.info(
+            f"Training: {start_epoch}->{train.epochs - 1} epochs | batch={effective_batch} | lr={train.optimizer.lr}"
+        )
+        logger.info(f"Data: {num_samples:,} samples/epoch")
+        if pseudo.get("enabled"):
+            logger.info(
+                f"Pseudo-ID: k={pseudo.get('knn_k', 20)} mutual={pseudo.get('mutual_topk', 5)}"
+            )
 
     # Schedules
     lr_fn = _build_lr_fn(cfg)
-    curriculum = build_curriculum_schedule(cfg)
     pseudo_sched = build_pseudo_schedule(cfg) if pseudo_enabled else ()
-    refresh_epochs = get_refresh_epochs(cfg) if pseudo_enabled else set()
     neg_cfg = pseudo_cfg.get("negatives", {})
-    mask_cluster, mask_topk = bool(neg_cfg.get("mask_same_pseudo_in_queue", True)), int(neg_cfg.get("mask_topk_most_similar", 8))
+    mask_cluster, mask_topk = (
+        bool(neg_cfg.get("mask_same_pseudo_in_queue", True)),
+        int(neg_cfg.get("mask_topk_most_similar", 8)),
+    )
     reset_queue = bool(neg_cfg.get("reset_queue_on_refresh", True))
     grad_clip = float(cfg.train.regularization.grad_clip_norm)
-    save_every, keep_last = int(cfg.train.checkpointing.save_every_epochs), int(cfg.train.checkpointing.keep_last)
+    save_every, keep_last = (
+        int(cfg.train.checkpointing.save_every_epochs),
+        int(cfg.train.checkpointing.keep_last),
+    )
     save_local = bool(cfg.train.checkpointing.get("save_local", False))
-
-    if sys.platform == "win32" and not use_binary:
-        prewarm_datasets(digiface_ds, digi2real_ds, num_workers, device)
 
     # Helper to access underlying model (unwrap DDP if needed)
     def get_moco():
@@ -271,187 +408,244 @@ def cmd_train(cfg: DictConfig) -> None:
     optimizer.zero_grad(set_to_none=True)
     train_start = time.perf_counter()
 
-    for epoch in range(start_epoch, epochs):
-        lr = lr_fn(epoch)
-        for pg in optimizer.param_groups:
-            pg["lr"] = lr
-        p_digi = curriculum_p_digiface(epoch, curriculum)
-        p_pseudo = get_pseudo_prob(epoch, pseudo_sched) if pseudo_enabled else 0.0
+    try:
+        for epoch in range(start_epoch, epochs):
+            lr = lr_fn(epoch)
+            for pg in optimizer.param_groups:
+                pg["lr"] = lr
+            p_pseudo = get_pseudo_prob(epoch, pseudo_sched) if pseudo_enabled else 0.0
 
-        # Pseudo-ID refresh (all ranks participate, but only main logs)
-        if pseudo_mgr and epoch in refresh_epochs:
-            datasets = [digiface_ds] + ([digi2real_ds] if digi2real_ds else [])
-            moco = get_moco()
-            stats = pseudo_mgr.refresh(moco, datasets, epoch, pseudo_mgr.get_threshold(), device, batch_size, num_workers)
-            if wandb_active and dist_ctx.is_main:
-                log_wandb(stats, step=global_step)
-            if reset_queue:
-                moco.reset_queue()
-
-        # Build epoch dataset
-        if use_binary:
-            # Binary mode with pseudo-ID support
-            base_ds = data.BinaryMixDataset(digiface_ds, None, 1.0, num_samples, seed + epoch * 17)
-            use_pseudo = pseudo_mgr and pseudo_mgr.state is not None and p_pseudo > 0
-            epoch_ds = (
-                data.PseudoPairTwoViewDataset(base_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17)
-                if use_pseudo else base_ds
-            )
-        else:
-            curr_ds = data.CurriculumMixTwoViewDataset(digiface_ds, digi2real_ds, p_digi, num_samples, seed + epoch * 17)
-            use_pseudo = pseudo_mgr and pseudo_mgr.state is not None
-            epoch_ds = data.PseudoPairTwoViewDataset(curr_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17) if use_pseudo else curr_ds
-
-        loader_kw = {"batch_size": batch_size, "num_workers": num_workers, "pin_memory": device.type == "cuda", "drop_last": True}
-        if num_workers > 0:
-            loader_kw.update(persistent_workers=True, prefetch_factor=2)
-            # Use fork for binary mode (COW memory sharing)
-            if use_binary and sys.platform != "win32":
-                loader_kw["multiprocessing_context"] = "fork"
-        loader = DataLoader(epoch_ds, **loader_kw)
-
-        # Epoch tracking
-        loss_sum = pos_sum = neg_sum = std_sum = grad_norm_sum = 0.0
-        n_steps = 0
-        grad_norm = 0.0
-        epoch_start = time.perf_counter()
-        img_count = 0
-
-        pbar = tqdm(loader, total=num_batches, desc=f"Epoch {epoch:03d} [{_get_phase(epoch)}]", unit="batch",
-                    disable=not dist_ctx.is_main)  # Only show progress on main process
-        for step, batch in enumerate(pbar):
-            # Unpack batch
-            if use_pseudo and len(batch) == 3:
-                im_q, im_k, cids = batch
-                cids = cids.to(dtype=torch.int32, device=device, non_blocking=True)
+            # Pseudo-ID refresh (all ranks participate, but only main logs)
+            # Refresh every 2 epochs starting from epoch 2
+            if pseudo_mgr and should_refresh_pseudo(epoch, cfg):
+                datasets = [digiface_ds]
+                moco = get_moco()
+                stats = pseudo_mgr.refresh(
+                    moco,
+                    datasets,
+                    epoch,
+                    pseudo_mgr.get_threshold(),
+                    device,
+                    batch_size,
+                    num_workers,
+                )
+                if wandb_active and dist_ctx.is_main:
+                    log_wandb(stats, step=global_step)
+                if reset_queue:
+                    moco.reset_queue()  # Build epoch dataset (binary mode with optional pseudo-ID)
+                # Binary mode with pseudo-ID support
+                base_ds = data.BinaryMixDataset(
+                    digiface_ds, None, 1.0, num_samples, seed + epoch * 17
+                )
+                use_pseudo = pseudo_mgr and pseudo_mgr.state is not None and p_pseudo > 0
+                epoch_ds = (
+                    data.PseudoPairTwoViewDataset(
+                        base_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17
+                    )
+                    if use_pseudo
+                    else base_ds
+                )
             else:
-                im_q, im_k, cids = batch[0], batch[1], None
+                raise ValueError(
+                    "Parquet mode removed - use binary cache. Run: uv run python src/commands/fast_convert.py"
+                )
 
-            img_count += im_q.shape[0]
-            im_q, im_k = im_q.to(device, non_blocking=True), im_k.to(device, non_blocking=True)
+            loader_kw = {
+                "batch_size": batch_size,
+                "num_workers": num_workers,
+                "pin_memory": device.type == "cuda",
+                "drop_last": True,
+            }
+            if num_workers > 0:
+                loader_kw.update(persistent_workers=True, prefetch_factor=2)
+                # Use fork for binary mode (COW memory sharing)
+                if supports_fork():
+                    loader_kw["multiprocessing_context"] = "fork"
+            loader = DataLoader(epoch_ds, **loader_kw)
 
-            # Forward + backward
-            with torch.amp.autocast("cuda", enabled=amp_enabled and device.type == "cuda", dtype=amp_dtype):
-                loss, stats = model(im_q, im_k, cluster_ids=cids,
-                                    mask_same_cluster=mask_cluster and use_pseudo, mask_topk=mask_topk if use_pseudo else 0)
-            (scaler.scale(loss / grad_accum) if scaler else (loss / grad_accum)).backward()
+            # Epoch tracking
+            loss_sum = pos_sum = neg_sum = std_sum = grad_norm_sum = 0.0
+            n_steps = 0
+            grad_norm = 0.0
+            epoch_start = time.perf_counter()
+            img_count = 0
 
-            # Optimizer step
-            if (step + 1) % grad_accum == 0:
-                if scaler:
-                    scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip if grad_clip > 0 else float("inf"))
-                if scaler:
-                    scaler.step(optimizer)
-                    scaler.update()
+            # Determine training phase for display
+            phase = "A:Stabilize" if epoch < 5 else "B:Bootstrap" if epoch < 35 else "C:Refine"
+            pbar = tqdm(
+                loader,
+                total=num_batches,
+                desc=f"Epoch {epoch:03d} [{phase}]",
+                unit="batch",
+                disable=not dist_ctx.is_main,
+            )  # Only show progress on main process
+            for step, batch in enumerate(pbar):
+                # Unpack batch
+                if use_pseudo and len(batch) == 3:
+                    im_q, im_k, cids = batch
+                    cids = cids.to(dtype=torch.int32, device=device, non_blocking=True)
                 else:
-                    optimizer.step()
-                optimizer.zero_grad(set_to_none=True)
-                get_moco().update_momentum_encoder()
-                global_step += 1
+                    im_q, im_k, cids = batch[0], batch[1], None
 
-            # Accumulate stats
-            loss_sum += stats["loss"]
-            pos_sum += stats["pos_sim"]
-            neg_sum += stats["neg_sim"]
-            std_sum += stats["emb_std"]
-            if (step + 1) % grad_accum == 0:
-                grad_norm_sum += float(grad_norm)
-            n_steps += 1
+                img_count += im_q.shape[0]
+                im_q, im_k = im_q.to(device, non_blocking=True), im_k.to(device, non_blocking=True)
 
-            # Log to wandb (main process only)
-            if wandb_active and dist_ctx.is_main and log_every > 0 and global_step % log_every == 0 and (step + 1) % grad_accum == 0:
-                m = {"train/loss": stats["loss"], "train/pos_sim": stats["pos_sim"], "train/neg_sim": stats["neg_sim"],
-                     "train/sim_gap": stats["pos_sim"] - stats["neg_sim"], "train/emb_std": stats["emb_std"],
-                     "train/grad_norm": float(grad_norm), "train/lr": lr, "train/epoch": epoch, "train/p_digiface": p_digi}
-                if pseudo_enabled:
-                    m.update({"train/pseudo_prob": p_pseudo, "train/neg_masked_pct": stats.get("neg_masked_pct", 0)})
-                m.update(log_gpu_memory())
-                log_wandb(m, step=global_step)
+                # Forward + backward
+                with torch.amp.autocast(
+                    "cuda", enabled=amp_enabled and device.type == "cuda", dtype=amp_dtype
+                ):
+                    loss, stats = model(
+                        im_q,
+                        im_k,
+                        cluster_ids=cids,
+                        mask_same_cluster=mask_cluster and use_pseudo,
+                        mask_topk=mask_topk if use_pseudo else 0,
+                    )
+                (scaler.scale(loss / grad_accum) if scaler else (loss / grad_accum)).backward()
 
-            # Update progress bar with avg img/s
-            now = time.perf_counter()
-            avg_ips = img_count / (now - epoch_start) if now > epoch_start else 0
-            pbar.set_postfix(loss=f"{stats['loss']:.4f}", pos=f"{stats['pos_sim']:.3f}", neg=f"{stats['neg_sim']:.3f}", ips=f"{avg_ips:.0f}")
+                # Optimizer step
+                if (step + 1) % grad_accum == 0:
+                    if scaler:
+                        scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), grad_clip if grad_clip > 0 else float("inf")
+                    )
+                    if scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
+                    optimizer.zero_grad(set_to_none=True)
+                    get_moco().update_momentum_encoder()
+                    global_step += 1
 
-        # Epoch summary (main process only for logging)
-        elapsed = time.perf_counter() - epoch_start
-        if n_steps > 0:
-            avg_loss, avg_pos, avg_neg = loss_sum/n_steps, pos_sum/n_steps, neg_sum/n_steps
-            # For DDP, multiply ips by world_size (each GPU processes batch_size images)
-            ips = img_count / elapsed * dist_ctx.world_size
-            gap = avg_pos - avg_neg
+                # Accumulate stats
+                loss_sum += stats["loss"]
+                pos_sum += stats["pos_sim"]
+                neg_sum += stats["neg_sim"]
+                std_sum += stats["emb_std"]
+                if (step + 1) % grad_accum == 0:
+                    grad_norm_sum += float(grad_norm)
+                n_steps += 1
 
-            if wandb_active and dist_ctx.is_main:
-                num_opt_steps = n_steps // grad_accum
-                em = {"epoch/loss": avg_loss, "epoch/pos_sim": avg_pos, "epoch/neg_sim": avg_neg, "epoch/sim_gap": gap,
-                      "epoch/emb_std": std_sum/n_steps, "epoch/grad_norm": grad_norm_sum/num_opt_steps if num_opt_steps > 0 else 0,
-                      "epoch/images_per_sec": ips, "epoch/lr": lr, "epoch/number": epoch}
-                if pseudo_mgr and pseudo_mgr.state:
-                    em["epoch/pseudo_clusters"] = pseudo_mgr.num_clusters
-                em.update(log_gpu_memory())
-                log_wandb(em, step=global_step)
+                # Log to wandb (main process only)
+                if (
+                    wandb_active
+                    and dist_ctx.is_main
+                    and log_every > 0
+                    and global_step % log_every == 0
+                    and (step + 1) % grad_accum == 0
+                ):
+                    m = {
+                        "train/loss": stats["loss"],
+                        "train/pos_sim": stats["pos_sim"],
+                        "train/neg_sim": stats["neg_sim"],
+                        "train/sim_gap": stats["pos_sim"] - stats["neg_sim"],
+                        "train/emb_std": stats["emb_std"],
+                        "train/grad_norm": float(grad_norm),
+                        "train/lr": lr,
+                        "train/epoch": epoch,
+                    }
+                    if pseudo_enabled:
+                        m.update(
+                            {
+                                "train/pseudo_prob": p_pseudo,
+                                "train/neg_masked_pct": stats.get("neg_masked_pct", 0),
+                            }
+                        )
+                    m.update(log_gpu_memory())
+                    log_wandb(m, step=global_step)
 
-            if dist_ctx.is_main:
-                done = epoch - start_epoch + 1
-                eta = _fmt_time((time.perf_counter() - train_start) / done * (epochs - epoch - 1))
-                logger.info(f"Epoch {epoch:03d} | loss={avg_loss:.4f} pos={avg_pos:.3f} neg={avg_neg:.3f} gap={gap:.3f} | {ips:.0f} ips | ETA: {eta}")
+                # Update progress bar with avg img/s
+                now = time.perf_counter()
+                avg_ips = img_count / (now - epoch_start) if now > epoch_start else 0
+                pbar.set_postfix(
+                    loss=f"{stats['loss']:.4f}",
+                    pos=f"{stats['pos_sim']:.3f}",
+                    neg=f"{stats['neg_sim']:.3f}",
+                    ips=f"{avg_ips:.0f}",
+                )
 
-        # Checkpoint (main process only)
-        if dist_ctx.is_main and ((epoch + 1) % save_every == 0 or epoch + 1 == epochs):
-            # For DDP, save the underlying model (unwrap DDP wrapper)
-            save_model = get_moco()
-            path = save_checkpoint(out_dir, epoch=epoch+1, model=save_model, optimizer=optimizer, scaler=scaler, cfg=cfg, pseudo_manager=pseudo_mgr)
+            # Epoch summary (main process only for logging)
+            elapsed = time.perf_counter() - epoch_start
+            if n_steps > 0:
+                avg_loss, avg_pos, avg_neg = (
+                    loss_sum / n_steps,
+                    pos_sum / n_steps,
+                    neg_sum / n_steps,
+                )
+                # For DDP, multiply ips by world_size (each GPU processes batch_size images)
+                ips = (img_count / elapsed * dist_ctx.world_size) if elapsed > 0 else 0
+                gap = avg_pos - avg_neg
 
-            # Upload to W&B with retry
-            upload_success = False
-            if wandb_active and cfg.get("wandb", {}).get("save_artifacts"):
-                for attempt in range(3):
-                    try:
-                        art = wandb.Artifact("checkpoint", type="model", metadata={"epoch": epoch+1})
-                        art.add_file(str(path))
-                        wandb.log_artifact(art, aliases=["latest"])
-                        art.wait()  # Wait for upload to complete
-                        upload_success = True
-                        logger.info(f"Uploaded: {path.name}")
-                        break
-                    except Exception as e:
-                        logger.warning(f"Upload attempt {attempt+1}/3 failed: {e}")
-                        time.sleep(5)
+                if wandb_active and dist_ctx.is_main:
+                    num_opt_steps = n_steps // grad_accum
+                    em = {
+                        "epoch/loss": avg_loss,
+                        "epoch/pos_sim": avg_pos,
+                        "epoch/neg_sim": avg_neg,
+                        "epoch/sim_gap": gap,
+                        "epoch/emb_std": std_sum / n_steps,
+                        "epoch/grad_norm": grad_norm_sum / num_opt_steps
+                        if num_opt_steps > 0
+                        else 0,
+                        "epoch/images_per_sec": ips,
+                        "epoch/lr": lr,
+                        "epoch/number": epoch,
+                    }
+                    if pseudo_mgr and pseudo_mgr.state:
+                        em["epoch/pseudo_clusters"] = pseudo_mgr.num_clusters
+                    em.update(log_gpu_memory())
+                    log_wandb(em, step=global_step)
 
-                if not upload_success:
-                    logger.error(f"Failed to upload {path.name} after 3 attempts - keeping local copy")
+                if dist_ctx.is_main:
+                    done = epoch - start_epoch + 1
+                    eta = _fmt_time(
+                        (time.perf_counter() - train_start) / done * (epochs - epoch - 1)
+                    )
+                    logger.info(
+                        f"Epoch {epoch:03d} | loss={avg_loss:.4f} pos={avg_pos:.3f} neg={avg_neg:.3f} gap={gap:.3f} | {ips:.0f} ips | ETA: {eta}"
+                    )
 
-                # Prune old artifact versions, keep last 5
-                if upload_success:
-                    try:
-                        api = wandb.Api()
-                        collection = api.artifact_collection("model", f"{wandb.run.entity}/{wandb.run.project}/checkpoint")
-                        versions = sorted(collection.versions(), key=lambda a: int(a.version.lstrip("v")), reverse=True)
-                        for old in versions[5:]:
-                            old.delete()
-                    except Exception:
-                        pass  # Don't crash training if cleanup fails
+            # Checkpoint (main process only)
+            if dist_ctx.is_main and ((epoch + 1) % save_every == 0 or epoch + 1 == epochs):
+                # For DDP, save the underlying model (unwrap DDP wrapper)
+                save_model = get_moco()
+                _save_checkpoint(
+                    cfg,
+                    out_dir,
+                    epoch,
+                    save_model,
+                    optimizer,
+                    scaler,
+                    pseudo_mgr,
+                    wandb_active,
+                    save_local,
+                    keep_last,
+                )
 
-            # Handle local storage - keep if upload failed
-            if save_local or not upload_success:
-                prune_checkpoints(out_dir / "checkpoints", keep_last)
-                logger.info(f"Saved locally: {path.name}")
-            else:
-                path.unlink(missing_ok=True)  # Delete only after confirmed upload
+            # Synchronize all ranks after checkpoint (ensures all wait for main to finish saving/uploading)
+            if dist_ctx.enabled:
+                dist.barrier()
 
-        # Synchronize all ranks after checkpoint (ensures all wait for main to finish saving/uploading)
-        if dist_ctx.enabled:
-            dist.barrier()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+    except Exception as e:
+        # Log the error and ensure cleanup happens
+        logger.error(f"Training failed with error: {e}", exc_info=True)
+        # Re-raise to allow caller to handle if needed
+        raise
+    finally:
+        # Always clean up distributed resources, even on failure
+        # Done
+        if dist_ctx.is_main:
+            if "train_start" in locals():
+                total = _fmt_time(time.perf_counter() - train_start)
+                logger.info(
+                    f"\n{'=' * 70}\n  Training complete in {total}\n  Checkpoints: {out_dir / 'checkpoints'}\n{'=' * 70}\n"
+                )
+            finish_wandb()
 
-    # Done
-    if dist_ctx.is_main:
-        total = _fmt_time(time.perf_counter() - train_start)
-        logger.info(f"\n{'='*70}\n  Training complete in {total}\n  Checkpoints: {out_dir/'checkpoints'}\n{'='*70}\n")
-        finish_wandb()
-
-    # Clean up distributed
-    cleanup_distributed()
+        # Clean up distributed
+        cleanup_distributed()

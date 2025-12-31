@@ -10,27 +10,14 @@ from typing import Any
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig, OmegaConf
-from torch.utils.data import DataLoader
 
 import wandb
-from src import data
 
 logger = logging.getLogger(__name__)
 
 
 def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
-    """Find the latest checkpoint from W&B or local folder.
-
-    Args:
-        project: W&B project name (e.g., "sniperface-v2")
-        local_dir: Local checkpoints directory to search if W&B fails
-
-    Returns:
-        Path to the latest checkpoint file
-
-    Raises:
-        FileNotFoundError: If no checkpoint found in W&B or locally
-    """
+    """Find the latest checkpoint from W&B or local folder."""
     # Try W&B first
     try:
         api = wandb.Api()
@@ -45,8 +32,10 @@ def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
         if pt_files:
             logger.info(f"Found checkpoint in W&B: {artifact.name}")
             return pt_files[0]
-    except Exception as e:
-        logger.debug(f"W&B checkpoint not found: {e}")
+    except (wandb.errors.CommError, ValueError, KeyError) as e:
+        logger.debug(f"W&B checkpoint not found (network/API error): {e}")
+    except OSError as e:
+        logger.debug(f"W&B checkpoint download failed (I/O error): {e}")
 
     # Fall back to local folder
     if local_dir and local_dir.exists():
@@ -56,6 +45,18 @@ def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
             return ckpts[-1]
 
     raise FileNotFoundError("No checkpoint found in W&B or locally")
+
+
+def _filter_warm_start_state(ckpt_state: dict) -> dict:
+    """Filter out queue buffers for warm start."""
+    if not isinstance(ckpt_state, dict):
+        raise TypeError(f"Expected model state_dict to be dict, got {type(ckpt_state)}")
+    skip_prefixes = ("queue", "queue_ptr", "queue_cluster_ids")
+    return {
+        k: v
+        for k, v in ckpt_state.items()
+        if isinstance(k, str) and not k.startswith(skip_prefixes)
+    }
 
 
 def load_checkpoint_for_resume(
@@ -68,57 +69,36 @@ def load_checkpoint_for_resume(
     pseudo_manager: Any = None,
     warm_start: bool = False,
 ) -> int:
-    """Load checkpoint and return the epoch to resume from.
-
-    Args:
-        resume_path: Path to checkpoint file
-        model: Model to load weights into
-        optimizer: Optimizer to load state into
-        scaler: Optional AMP scaler
-        device: Target device
-        pseudo_manager: Optional PseudoIDManager to load state into
-        warm_start: If True, reset epoch to 0 and clear pseudo state
-    """
+    """Load checkpoint and return the epoch to resume from."""
     path = Path(resume_path)
     if not path.exists():
         raise FileNotFoundError(f"Resume checkpoint not found: {path}")
 
-    ckpt = torch.load(path, map_location=device, weights_only=False)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     ckpt_epoch = int(ckpt.get("epoch", 0))
+    ckpt_state = _filter_warm_start_state(ckpt["model"]) if warm_start else ckpt["model"]
 
-    # For warm start, filter out queue buffers (they may have different sizes)
-    ckpt_state = ckpt["model"]
-    if warm_start:
-        # Only load backbone and projector weights, skip queue buffers
-        skip_prefixes = ("queue", "queue_ptr", "queue_cluster_ids")
-        ckpt_state = {
-            k: v for k, v in ckpt_state.items()
-            if not k.startswith(skip_prefixes)
-        }
-
-    # Load model with strict=False to handle new/missing buffers
+    if not isinstance(ckpt_state, dict):
+        raise TypeError(f"Expected model state_dict to be dict, got {type(ckpt_state)}")
     model.load_state_dict(ckpt_state, strict=False)
 
-    if not warm_start:
-        optimizer.load_state_dict(ckpt["optimizer"])
-        if scaler is not None and "scaler" in ckpt:
-            scaler.load_state_dict(ckpt["scaler"])
-
-        # Load pseudo-ID state if available
-        if pseudo_manager is not None and "pseudo" in ckpt:
-            from src.pseudo import PseudoIDState
-            pseudo_manager.state = PseudoIDState.from_dict(ckpt["pseudo"])
-
-        start_epoch = ckpt_epoch
-        logger.info(f"Resumed from {path.name} at epoch {start_epoch}")
-    else:
-        # Warm start: reset epoch, don't load optimizer/scaler/pseudo
-        start_epoch = 0
+    if warm_start:
         if pseudo_manager is not None:
             pseudo_manager.clear()
         logger.info(f"Warm start from {path.name} (checkpoint epoch {ckpt_epoch})")
+        return 0
 
-    return start_epoch
+    optimizer.load_state_dict(ckpt["optimizer"])
+    if scaler is not None and "scaler" in ckpt:
+        scaler.load_state_dict(ckpt["scaler"])
+
+    if pseudo_manager is not None and "pseudo" in ckpt:
+        from src.pseudo import PseudoIDState
+
+        pseudo_manager.state = PseudoIDState.from_dict(ckpt["pseudo"])
+
+    logger.info(f"Resumed from {path.name} at epoch {ckpt_epoch}")
+    return ckpt_epoch
 
 
 def save_checkpoint(
@@ -131,17 +111,7 @@ def save_checkpoint(
     cfg: DictConfig,
     pseudo_manager: Any = None,
 ) -> Path:
-    """Save a training checkpoint.
-
-    Args:
-        out_dir: Output directory
-        epoch: Current epoch (1-indexed, after completion)
-        model: Model to save
-        optimizer: Optimizer to save
-        scaler: Optional AMP scaler
-        cfg: Config to save
-        pseudo_manager: Optional PseudoIDManager to save state from
-    """
+    """Save a training checkpoint."""
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / f"epoch_{epoch:03d}.pt"
@@ -154,8 +124,6 @@ def save_checkpoint(
     }
     if scaler is not None:
         payload["scaler"] = scaler.state_dict()
-
-    # Save pseudo-ID state if available
     if pseudo_manager is not None and pseudo_manager.state is not None:
         payload["pseudo"] = pseudo_manager.state.to_dict()
 
@@ -173,50 +141,3 @@ def prune_checkpoints(ckpt_dir: Path, keep_last: int) -> None:
     for fp in ckpts[:-keep_last]:
         fp.unlink(missing_ok=True)
         logger.debug(f"Pruned checkpoint: {fp}")
-
-
-def prewarm_datasets(
-    digiface_ds: data.ParquetTwoViewDataset,
-    digi2real_ds: data.ParquetTwoViewDataset | None,
-    num_workers: int,
-    device: torch.device,
-) -> None:
-    """Pre-warm both datasets in parallel by iterating one sample from each."""
-    import concurrent.futures
-
-    if num_workers <= 0:
-        logger.info("Skipping dataset pre-warm (num_workers=0)")
-        return
-
-    logger.info("Pre-warming datasets to initialize workers...")
-
-    def warm_one(ds: data.ParquetTwoViewDataset, name: str, p_digi: float) -> str:
-        """Warm a single dataset."""
-        warm_ds = data.CurriculumMixTwoViewDataset(
-            digiface=digiface_ds,
-            digi2real=ds if p_digi < 1.0 else None,
-            p_digiface=p_digi,
-            num_samples=num_workers * 2,
-            seed=0,
-        )
-        warm_loader = DataLoader(
-            warm_ds,
-            batch_size=1,
-            num_workers=num_workers,
-            pin_memory=(device.type == "cuda"),
-            persistent_workers=False,
-        )
-        for _batch in warm_loader:
-            break
-        del warm_loader, warm_ds
-        return f"  {name} dataset warmed"
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(warm_one, digiface_ds, "DigiFace", 1.0)]
-        if digi2real_ds is not None:
-            futures.append(executor.submit(warm_one, digi2real_ds, "Digi2Real", 0.0))
-
-        for future in concurrent.futures.as_completed(futures):
-            logger.info(future.result())
-
-    logger.info("Dataset pre-warming complete")

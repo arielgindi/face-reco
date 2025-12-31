@@ -21,7 +21,7 @@ import sys
 import hydra
 from omegaconf import DictConfig, OmegaConf
 
-from src.commands import cmd_embed, cmd_eval, cmd_train
+from src.commands import cmd_train
 
 logger = logging.getLogger(__name__)
 
@@ -36,10 +36,6 @@ def main(cfg: DictConfig) -> None:
 
     if command == "train":
         cmd_train(cfg)
-    elif command == "embed":
-        cmd_embed(cfg)
-    elif command == "eval":
-        cmd_eval(cfg)
     else:
         logger.error(f"Unknown command: {command}")
         sys.exit(1)
