@@ -53,31 +53,59 @@ wandb:
 # =============================================================================
 # Data Configuration
 # =============================================================================
+# Binary-only mode: Uses pre-decoded images stored in .npy format
+# No parquet support - all data must be converted to binary cache first
+# Use fast_convert.py to convert parquet files to binary format
 data:
-  digiface_glob: "data/digiface1m_*.parquet"
-  digi2real_glob: "data/digi2real_*.parquet"
-
+  # Dataset splitting configuration
   split:
-    train_ratio: 0.75
-    seed: 42
-    cache_dir: ".cache/splits"
+    train_ratio: 0.75  # Fraction of data for training (0.75 = 75% train, 25% test)
+    seed: 42           # Random seed for reproducible splits
+    cache_dir: ".cache/splits"  # Directory to cache split metadata
 
-  streaming:
-    batch_read_rows: 4096
-    shuffle_buffer_size: 4096
-    num_workers: 4
+  # Binary cache conversion configuration (fast_convert.py)
+  # Note: Parquet file paths must be provided via CLI arguments
+  # Example: uv run python fast_convert.py data/digiface1m_*.parquet
+  binary_convert:
+    batch_size: 1024                  # Parquet read batch size during conversion
+                                      # Larger = faster conversion, more memory
+                                      # Range: 512-2048 recommended
+    worker_cores_reserved: 2          # Reserve N cores (total_cores - N = worker count)
+                                      # Reserve 1-2 cores for OS and other tasks
+
+  # Binary dataset configuration (BinaryImageDataset for fast training)
+  binary_dataset:
+    # Block size for sequential IO optimization (Windows mmap)
+    # Larger blocks = better sequential reads, less random seeking
+    # Must be power of 2 for optimal memory alignment
+    # Range: 4096-16384 recommended
+    # 8192 = good balance between locality and shuffle quality
+    block_size: 8192
+
+    # Worker RNG seed offset (prime number for hash distribution)
+    # Why 7919? It's a prime that distributes worker seeds well across hash space
+    # Used to ensure each worker has independent, non-overlapping random sequences
+    # Formula: worker_seed = base_seed + worker_id * seed_offset
+    # Must be a large prime number to avoid correlation between workers
+    worker_seed_offset: 7919
 
 # =============================================================================
 # Model Architecture
 # =============================================================================
 model:
   backbone:
-    name: "iresnet50"
-    input_size: [112, 112]
-    embedding_dim: 512
-    l2_normalize: true
-    bn_eps: 1.0e-5
-    bn_momentum: 0.1
+    name: "iresnet50"       # IResNet50 architecture (improved ResNet for faces)
+                            # Only "iresnet50" is currently supported
+    input_size: [112, 112]  # Input image size (height, width) in pixels
+                            # Standard size for face recognition models
+    embedding_dim: 512      # Dimensionality of output embeddings
+                            # 512 is standard for face recognition (ArcFace, CosFace)
+    l2_normalize: true      # L2-normalize embeddings to unit sphere
+                            # Required for cosine similarity-based losses
+    bn_eps: 1.0e-5          # Batch normalization epsilon (numerical stability)
+                            # Default PyTorch value
+    bn_momentum: 0.1        # Batch normalization momentum for running stats
+                            # Range: 0.0-1.0, 0.1 is PyTorch default
 
 # =============================================================================
 # Self-Supervised Learning (MoCo v2 + MarginNCE)
@@ -86,61 +114,112 @@ model:
 # Margin increased to push different identities apart
 # Queue doubled for more negative diversity
 ssl:
-  algorithm: "moco_v2_margin_nce"
-  queue_size: 65536           # Doubled from 32K for separation
-  momentum_encoder: 0.999
-  temperature: 0.05           # Sharper than 0.07 (crowded space fix)
+  algorithm: "moco_v2_margin_nce"  # MoCo v2 with additive margin on positives
+  queue_size: 65536           # Number of negative samples in the queue
+                              # Doubled from 32K for better negative diversity
+                              # Should be divisible by (batch_size * world_size) for DDP
+                              # Range: 16384-131072 recommended
+  momentum_encoder: 0.999     # EMA coefficient for key encoder updates
+                              # Higher = slower updates, more stable features
+                              # Range: 0.99-0.999, 0.999 is standard
+  temperature: 0.05           # Temperature scaling for contrastive loss
+                              # Lower = sharper decision boundaries (harder training)
+                              # Higher = softer boundaries (easier training)
+                              # Range: 0.05-0.20, 0.07 is MoCo default
   margin_nce:
-    enabled: true
-    margin: 0.15              # Stronger than 0.10 (push identities apart)
+    enabled: true             # Enable additive margin on positive logits
+    margin: 0.15              # Margin value to subtract from positive similarity
+                              # Higher = push different identities further apart
+                              # Range: 0.05-0.20, 0.10 is typical
 
 # =============================================================================
 # Pseudo-ID Bootstrapping (TRAIN split only, no identity_id used)
 # =============================================================================
 pseudo:
-  enabled: true
+  enabled: true  # Enable pseudo-ID mining (mutual k-NN clustering)
+                 # Set to false for pure MoCo training without pseudo-IDs
+
+  # -------------------------------------------------------------------------
+  # Embedding Configuration
+  # -------------------------------------------------------------------------
+  embed:
+    # Base batch size for embedding extraction (platform-optimized automatically)
+    batch_size_base: 8192       # Base batch size for Unix (fork COW)
+                                # Windows automatically gets 25% (2048) due to mmap memory pressure
+                                # Unix uses fork with copy-on-write, can use larger batches
+
+    # Embedding batch/worker multipliers (for pseudo-ID refresh)
+    embed_batch_multiplier: 4  # embed_batch_size = train_batch_size * multiplier
+                               # Embedding is inference-only, can use larger batches
+    embed_workers_multiplier: 2  # embed_workers = max(8, train_workers * multiplier)
+                                 # More workers for faster embedding during refresh
+
+    # Rejection sampling for cluster partner selection
+    rejection_sampling_tries: 10  # Number of attempts to sample different image from cluster
+                                  # Fast for small clusters, falls back to filtering if exceeded
+
+    # FAISS GPU configuration
+    faiss_temp_memory_gb: 2      # GPU temp memory in GB (2 << 30 bytes)
+                                 # Used for FAISS index construction
+                                 # Range: 1-4 GB depending on GPU memory
+    faiss_nprobe: 64             # FAISS IVF nprobe parameter (CPU mode only)
+                                 # Number of clusters to search in IVF index
+                                 # Higher = more accurate but slower search
+                                 # Range: 16-128 recommended
 
   # -------------------------------------------------------------------------
   # Mutual-kNN Graph Construction
   # -------------------------------------------------------------------------
   knn_k: 20                   # Search k neighbors per image
+                              # Larger k = more candidates but slower search
+                              # Range: 10-50 recommended
   mutual_topk: 5              # Edge kept only if mutual top-5
+                              # Must be <= knn_k
+                              # Smaller = stricter mutual requirement, higher precision
+                              # Range: 3-10 recommended
 
-  # Similarity threshold with coverage-driven adaptation
-  sim_threshold:
-    mode: "adaptive"          # "adaptive" or "fixed"
-    start: 0.68               # Starting threshold (lowered from 0.72)
-    end: 0.48                 # Minimum threshold floor
-    target_coverage: 0.40     # Target 40% of images clustered
-    adaptation_rate: 0.02     # Threshold adjustment per refresh cycle
+  # Fixed similarity threshold for pseudo-ID mining
+  sim_threshold: 0.60         # Cosine similarity threshold for accepting edges
+                              # Higher = stricter matching, fewer clusters
+                              # Range: 0.5-0.7 recommended
 
   # Cluster size bounds
   min_cluster_size: 2         # Need 2+ images for cross-image pairs
+                              # Must be >= 2 for pseudo-ID training
   max_cluster_size: 50        # Prevent identity merges
+                              # Clusters larger than this are likely merging different identities
+                              # Range: 30-100 depending on dataset quality
 
   # -------------------------------------------------------------------------
-  # Refresh Schedule (end of these epochs)
+  # Refresh Schedule
   # -------------------------------------------------------------------------
-  refresh_epochs: [4, 9, 14, 24, 34, 49, 64]
+  # Pseudo-IDs refresh automatically every 2 epochs (epochs 2, 4, 6, 8, ...)
 
   # -------------------------------------------------------------------------
   # Positive Pair Mixing Schedule
   # -------------------------------------------------------------------------
   pos_mix:
     min_same_image_prob: 0.15   # Always keep 15% aug-pairs for stability
+                                # Ensures model doesn't forget augmentation invariance
+                                # Range: 0.1-0.3 recommended
     schedule:
+      # Probability of using pseudo-ID pairs vs augmentation pairs
+      # pseudo_prob: 0.0 = 100% augmentation pairs (same image, different augmentations)
+      # pseudo_prob: 1.0 = 100% cross-image pairs (different images, same pseudo-ID)
+      # Actual pseudo probability = max(min_same_image_prob, pseudo_prob from schedule)
       - start_epoch: 0
         end_epoch: 4
-        pseudo_prob: 0.00       # Phase A: stabilize only
+        pseudo_prob: 0.00       # Phase A: stabilize only (pure MoCo)
+                                # Build basic features before using pseudo-IDs
       - start_epoch: 5
         end_epoch: 9
-        pseudo_prob: 0.30       # Gentle introduction
+        pseudo_prob: 0.30       # Gentle introduction of pseudo-ID pairs
       - start_epoch: 10
         end_epoch: 19
-        pseudo_prob: 0.60       # Ramp up
+        pseudo_prob: 0.60       # Ramp up cross-image learning
       - start_epoch: 20
         end_epoch: 34
-        pseudo_prob: 0.85       # Heavy cross-image
+        pseudo_prob: 0.85       # Heavy cross-image training
       - start_epoch: 35
         end_epoch: 10000
         pseudo_prob: 0.90       # Maximum identity learning
@@ -148,73 +227,94 @@ pseudo:
   # -------------------------------------------------------------------------
   # Negative Hygiene (prevents false-negative trap)
   # -------------------------------------------------------------------------
+  # False negatives = treating same-identity images as negatives
+  # This can collapse embeddings or prevent learning identity features
   negatives:
     mask_same_pseudo_in_queue: true     # Don't push same-cluster apart
-    mask_topk_most_similar: 8           # Also mask top-8 (likely same person)
-    reset_queue_on_refresh: true        # Clear stale pseudo-IDs
+                                        # Masks negatives from queue that share pseudo-ID with query
+                                        # Critical to prevent model collapse
+    mask_topk_most_similar: 8           # Also mask top-8 most similar negatives
+                                        # These are likely same person even if not in same cluster
+                                        # Range: 5-20 recommended
+                                        # 0 = disable this feature
+    reset_queue_on_refresh: true        # Clear stale pseudo-IDs from queue on refresh
+                                        # Old embeddings/clusters may be inconsistent with new ones
+                                        # Recommended to keep true
 
 # =============================================================================
 # Training Configuration
 # =============================================================================
 train:
-  epochs: 75
-  samples_per_epoch: 0
+  epochs: 75                   # Total training epochs
+  samples_per_epoch: 0         # Samples per epoch (0 = use full dataset)
+                               # For iterable datasets, controls epoch length
+                               # 0 = infinite iteration (epoch defined by step count)
 
   # Resume: "auto" (W&B → local → crash), specific path, or null/false for fresh start
-  resume: "auto"
-  warm_start: false
+  resume: "auto"              # Resume from checkpoint
+                              # "auto" = try W&B, then local checkpoints, then crash recovery
+                              # "path/to/checkpoint.pt" = specific checkpoint file
+                              # null/false = start from scratch
+  warm_start: false           # Load backbone only (not optimizer/scheduler)
+                              # false = full resume (all training state)
+                              # true = only load model weights
 
   precision:
-    amp: true
-    amp_dtype: "fp16"
-    tf32_matmul: true
-    torch_compile: false
+    amp: true                 # Automatic mixed precision (FP16/BF16)
+                              # Faster training, lower memory, minimal accuracy loss
+    amp_dtype: "fp16"         # AMP dtype: "fp16" or "bf16"
+                              # fp16 = better compatibility, bf16 = better numerical stability
+    tf32_matmul: true         # Use TF32 for matmul on Ampere+ GPUs
+                              # Faster than FP32, more accurate than FP16
+    torch_compile: false      # PyTorch 2.0 compilation (experimental)
+                              # Can provide speedup but may have compatibility issues
 
   batch:
-    size: 128
-    grad_accum_steps: 2       # Effective batch = 256
+    size: 128                 # Per-GPU batch size
+    grad_accum_steps: 2       # Gradient accumulation steps
+                              # Effective batch = size * grad_accum_steps * num_gpus
+                              # Here: 128 * 2 = 256 effective batch
 
   # Lower LR for fine-tuning from trained model
   optimizer:
-    name: "sgd"
-    lr: 0.02                  # Lower than initial 0.05
-    momentum: 0.9
-    weight_decay: 5.0e-4
-    nesterov: true
+    name: "sgd"               # Optimizer: "sgd" or "adam"
+    lr: 0.02                  # Learning rate (base LR for batch size 256)
+                              # Lower than initial 0.05 for fine-tuning
+                              # Scale with batch size: lr = base_lr * (batch_size / 256)
+    momentum: 0.9             # SGD momentum (ignored for Adam)
+                              # Range: 0.9-0.99
+    weight_decay: 5.0e-4      # L2 regularization
+                              # Range: 1e-5 to 1e-3
+    nesterov: true            # Use Nesterov momentum (SGD only)
 
   lr_schedule:
-    name: "multistep"
+    name: "multistep"         # LR scheduler: "multistep", "cosine", "constant"
     warmup:
-      enabled: true
-      epochs: 2
-      start_lr: 0.002
-    milestones: [20, 40, 60]  # Decay at phase transitions
-    gamma: 0.5                # Keep LR meaningful late in training
+      enabled: true           # Linear warmup from start_lr to lr
+      epochs: 2               # Warmup duration in epochs
+      start_lr: 0.002         # Initial LR (1/10 of target LR is typical)
+    milestones: [20, 40, 60]  # Epochs to decay LR (multistep only)
+                              # Decay at phase transitions in training
+    gamma: 0.5                # LR decay factor at each milestone
+                              # Range: 0.1-0.5, 0.5 keeps LR meaningful longer
 
   regularization:
-    grad_clip_norm: 5.0
+    grad_clip_norm: 5.0       # Gradient clipping by global norm
+                              # Prevents exploding gradients
+                              # Range: 1.0-10.0, 5.0 is conservative
 
   checkpointing:
-    save_every_epochs: 1
-    keep_last: 10
-    save_local: false  # Only save to W&B by default
+    save_every_epochs: 1      # Save checkpoint every N epochs
+    keep_last: 10             # Keep only last N checkpoints (local storage)
+    save_local: false         # Save checkpoints locally
+                              # false = only save to W&B
+                              # true = save to local disk + W&B
 
 # =============================================================================
-# Curriculum Learning (Data Mixing)
+# Data Mode
 # =============================================================================
-# Delay Digi2Real until pseudo-IDs are stable
-# Digi2Real has 20 img/identity = higher false-negative risk
-curriculum:
-  schedule:
-    - start_epoch: 0
-      end_epoch: 19
-      p_digiface: 1.0         # 100% clean DigiFace during bootstrap
-    - start_epoch: 20
-      end_epoch: 39
-      p_digiface: 0.7         # Gradual realism introduction
-    - start_epoch: 40
-      end_epoch: 10000
-      p_digiface: 0.35        # Heavy Digi2Real for final robustness
+# Binary cache mode only - uses pre-decoded images for maximum speed
+# No curriculum mixing - single dataset (binary cache contains merged data)
 
 # =============================================================================
 # Augmentations (Face-Safe: Preserve Identity)
@@ -292,6 +392,13 @@ embed:
 # Evaluation
 # =============================================================================
 eval:
-  enroll_per_id: 2            # Guarantees queries exist for 5-image identities
-  top_k: 5
-  query_batch: 50000
+  enroll_per_id: 2            # Number of images per identity to use for enrollment (gallery)
+                              # Remaining images are used as queries
+                              # Guarantees queries exist for identities with >= 5 images
+                              # Range: 1-5
+  top_k: 5                    # Compute Rank@K accuracy (K=1,5,10)
+                              # Rank@1 = identification accuracy
+                              # Rank@5 = query matches top-5 gallery
+  query_batch: 50000          # Maximum queries to evaluate in one batch
+                              # Larger = faster but more memory
+                              # Reduce if running out of memory

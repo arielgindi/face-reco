@@ -2,15 +2,7 @@
 
 __version__ = "0.1.0"
 
-from src.data import (
-    CurriculumMixTwoViewDataset,
-    ParquetEmbedDataset,
-    ParquetTwoViewDataset,
-    StreamParams,
-    count_parquet_rows,
-    get_identity_set,
-    get_or_create_splits,
-)
+from src.data import BinaryImageDataset, BinaryMixDataset
 from src.model import (
     IResNet,
     MoCo,
@@ -22,19 +14,14 @@ from src.model import (
 )
 
 __all__ = [
-    "CurriculumMixTwoViewDataset",
+    "BinaryImageDataset",
+    "BinaryMixDataset",
     "IResNet",
     "MoCo",
     "MoCoConfig",
-    "ParquetEmbedDataset",
-    "ParquetTwoViewDataset",
-    "StreamParams",
     "__version__",
     "backbone_state_from_checkpoint",
     "build_backbone",
     "build_moco",
-    "count_parquet_rows",
-    "get_identity_set",
-    "get_or_create_splits",
     "l2_normalize",
 ]

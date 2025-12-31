@@ -13,7 +13,7 @@ from albumentations.pytorch import ToTensorV2
 from omegaconf import DictConfig
 from PIL import Image
 
-from src.data import PILImage
+PILImage = Image.Image  # Type alias for PIL images
 
 
 class RandomJPEGCompression:
@@ -167,13 +167,24 @@ def build_album_transform(view_cfg: DictConfig, *, input_size: tuple[int, int]) 
     cj_cfg = view_cfg.get("color_jitter", {})
     if cj_cfg and float(cj_cfg.get("p", 0.0)) > 0.0:
         p = float(cj_cfg.get("p", 0.8))
-        ops.append(A.ColorJitter(
-            brightness=(1 - float(cj_cfg.get("brightness", 0.4)), 1 + float(cj_cfg.get("brightness", 0.4))),
-            contrast=(1 - float(cj_cfg.get("contrast", 0.4)), 1 + float(cj_cfg.get("contrast", 0.4))),
-            saturation=(1 - float(cj_cfg.get("saturation", 0.4)), 1 + float(cj_cfg.get("saturation", 0.4))),
-            hue=(-float(cj_cfg.get("hue", 0.1)), float(cj_cfg.get("hue", 0.1))),
-            p=p,
-        ))
+        ops.append(
+            A.ColorJitter(
+                brightness=(
+                    1 - float(cj_cfg.get("brightness", 0.4)),
+                    1 + float(cj_cfg.get("brightness", 0.4)),
+                ),
+                contrast=(
+                    1 - float(cj_cfg.get("contrast", 0.4)),
+                    1 + float(cj_cfg.get("contrast", 0.4)),
+                ),
+                saturation=(
+                    1 - float(cj_cfg.get("saturation", 0.4)),
+                    1 + float(cj_cfg.get("saturation", 0.4)),
+                ),
+                hue=(-float(cj_cfg.get("hue", 0.1)), float(cj_cfg.get("hue", 0.1))),
+                p=p,
+            )
+        )
 
     # Grayscale
     gs_p = float(view_cfg.get("grayscale_p", 0.0))
@@ -207,12 +218,14 @@ def build_album_transform(view_cfg: DictConfig, *, input_size: tuple[int, int]) 
         p = float(cut_cfg.get("p", 0.2))
         holes = int(cut_cfg.get("holes", 1))
         size_ratio = tuple(cut_cfg.get("size_ratio", [0.10, 0.30]))
-        ops.append(A.CoarseDropout(
-            num_holes_range=(1, holes),
-            hole_height_range=(int(h * size_ratio[0]), int(h * size_ratio[1])),
-            hole_width_range=(int(w * size_ratio[0]), int(w * size_ratio[1])),
-            p=p,
-        ))
+        ops.append(
+            A.CoarseDropout(
+                num_holes_range=(1, holes),
+                hole_height_range=(int(h * size_ratio[0]), int(h * size_ratio[1])),
+                hole_width_range=(int(w * size_ratio[0]), int(w * size_ratio[1])),
+                p=p,
+            )
+        )
 
     # Normalize and convert to tensor
     ops.append(A.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]))

@@ -67,6 +67,11 @@ class MoCoConfig:
         if self.margin < 0:
             raise ValueError(f"margin must be >= 0, got {self.margin}")
 
+        # Note: queue_size compatibility with batch_size and world_size should be validated
+        # at runtime in the training script, as MoCoConfig doesn't have access to those values.
+        # Recommended: queue_size should be divisible by (batch_size * world_size) for DDP
+        # to prevent pointer drift across epochs. Add a warning in train.py if not satisfied.
+
 
 class MoCo(nn.Module):
     """MoCo with a momentum encoder and a queue.
@@ -224,9 +229,7 @@ class MoCo(nn.Module):
 
         # Default cluster IDs to -1 if not provided
         if cluster_ids is None:
-            cluster_ids = torch.full(
-                (batch_size,), -1, dtype=torch.int32, device=keys.device
-            )
+            cluster_ids = torch.full((batch_size,), -1, dtype=torch.int32, device=keys.device)
 
         # Handle wraparound
         if ptr + batch_size > k:
@@ -246,7 +249,8 @@ class MoCo(nn.Module):
 
         # Synchronize queue pointer across all ranks to prevent divergence
         if dist.is_initialized() and dist.get_world_size() > 1:
-            dist.barrier()
+            # Broadcast from rank 0 to ensure all ranks have the same pointer value
+            dist.broadcast(self.queue_ptr, src=0)
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Produce the backbone embedding for retrieval (512-D by default)."""
@@ -340,10 +344,14 @@ class MoCo(nn.Module):
         stats: dict[str, Any] = {
             "loss": float(loss.detach().cpu()),
             "pos_sim": float((l_pos + self.cfg.margin).mean().detach().cpu()),
-            "neg_sim": float(valid_neg.mean().detach().cpu()) if (valid_neg := l_neg[l_neg > float("-inf")]).numel() > 0 else 0.0,
+            "neg_sim": float(valid_neg.mean().detach().cpu())
+            if (valid_neg := l_neg[l_neg > float("-inf")]).numel() > 0
+            else 0.0,
             "queue_ptr": int(self.queue_ptr.item()),
             "emb_std": float(emb_q.detach().std(dim=0).mean().cpu()),
-            "neg_masked_pct": neg_masked_count / (batch_size * queue_size) if queue_size > 0 else 0.0,
+            "neg_masked_pct": neg_masked_count / (batch_size * queue_size)
+            if queue_size > 0
+            else 0.0,
         }
         return loss, stats
 

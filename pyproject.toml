@@ -5,8 +5,6 @@ description = "One-day label-free face encoder (MoCo + MarginNCE)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-  "pyarrow",
-  "polars",
   "numpy",
   "pyyaml",
   "tqdm",
