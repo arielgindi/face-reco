@@ -15,6 +15,29 @@ Reference: https://ar5iv.org/pdf/2211.07371 (USynthFace - MarginNCE)
 
 from __future__ import annotations
 
+# Enable PTX JIT for Blackwell GPUs (sm_120+) before any CUDA imports
+import os
+import subprocess
+
+def _enable_blackwell_ptx_jit() -> None:
+    """Enable PTX JIT compilation for Blackwell GPUs before CUDA init."""
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            cc = result.stdout.strip().split("\n")[0]  # e.g., "12.0"
+            major = int(cc.split(".")[0])
+            if major >= 10:  # Blackwell is CC 10.0+
+                os.environ["CUDA_FORCE_PTX_JIT"] = "1"
+    except Exception:
+        pass  # Silently ignore - not critical
+
+_enable_blackwell_ptx_jit()
+
 import logging
 import sys
 
