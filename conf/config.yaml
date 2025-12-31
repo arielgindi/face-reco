@@ -146,10 +146,13 @@ pseudo:
   # Embedding Configuration
   # -------------------------------------------------------------------------
   embed:
-    # Base batch size for embedding extraction (platform-optimized automatically)
-    batch_size_base: 8192       # Optimal for high-end GPUs (RTX 4090/5090 with 24GB+ VRAM)
-                                # Reduced automatically on Windows if needed
-                                # Unix uses fork with copy-on-write, can use larger batches
+    # Base batch size for embedding extraction (auto-scaled by GPU memory)
+    batch_size_base: 8192       # Target for high-end GPUs (24GB+ VRAM)
+                                # Auto-scaled based on detected GPU memory:
+                                # - RTX 4070 Ti (12GB) → 2048 (base // 4)
+                                # - RTX 4090 (24GB) → 4096 (base // 2)
+                                # - RTX 5090 (32GB) → 8192 (full base)
+                                # See get_optimal_batch_size() in platform.py
 
     # Embedding batch/worker multipliers (for pseudo-ID refresh)
     embed_batch_multiplier: 4  # embed_batch_size = train_batch_size * multiplier

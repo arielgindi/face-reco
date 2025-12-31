@@ -11,6 +11,7 @@ from src.utils.distributed import (
     setup_distributed,
 )
 from src.utils.platform import (
+    get_gpu_memory_gb,
     get_optimal_batch_size,
     is_windows,
     supports_fork,
@@ -22,6 +23,7 @@ __all__ = [
     "cleanup_distributed",
     "compute_epoch_batch_counts",
     "configure_precision",
+    "get_gpu_memory_gb",
     "get_optimal_batch_size",
     "is_windows",
     "set_seed",
