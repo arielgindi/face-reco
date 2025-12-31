@@ -204,38 +204,24 @@ class PseudoIDManager:
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
     def _build_knn_graph(self, embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        from src.utils.faiss_loader import create_cpu_index, create_gpu_index, load_faiss
+
         num_images, embed_dim = embeddings.shape
         search_k = self.knn_k + 1
 
-        try:
-            import faiss
+        faiss = load_faiss()
+        if faiss is not None:
+            # Try GPU first, fall back to CPU IVF
+            faiss_idx = create_gpu_index(faiss, embed_dim, self.faiss_temp_memory_gb)
+            if faiss_idx is None:
+                faiss_idx = create_cpu_index(faiss, embed_dim, num_images, self.faiss_nprobe)
+                faiss_idx.index.train(embeddings)
 
-            use_gpu = False
-            try:
-                gpu_resources = faiss.StandardGpuResources()
-                gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
-                use_gpu = True
-            except Exception as e:
-                logger.warning(f"FAISS GPU unavailable: {e}")
-
-            if use_gpu:
-                index = faiss.IndexFlatIP(embed_dim)
-                index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
-                logger.info("        k-NN backend: FAISS-GPU")
-            else:
-                nlist = min(4096, num_images // 100)
-                quantizer = faiss.IndexFlatIP(embed_dim)
-                index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
-                index.nprobe = self.faiss_nprobe
-                logger.info(
-                    f"        k-NN backend: FAISS-CPU (IVF, nlist={nlist}, nprobe={self.faiss_nprobe})"
-                )
-                index.train(embeddings)
-
-            index.add(embeddings)
-            similarities, indices = index.search(embeddings, search_k)
-        except ImportError:
-            logger.info("        k-NN backend: sklearn")
+            faiss_idx.index.add(embeddings)
+            similarities, indices = faiss_idx.index.search(embeddings, search_k)
+        else:
+            # Fallback to sklearn if FAISS not installed
+            logger.info("k-NN backend: sklearn")
             from sklearn.neighbors import NearestNeighbors
 
             nn_model = NearestNeighbors(n_neighbors=search_k, metric="cosine").fit(embeddings)
