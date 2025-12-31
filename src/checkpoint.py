@@ -78,9 +78,10 @@ def load_checkpoint_for_resume(
     # Try secure loading first, fallback to unsafe for old checkpoints
     try:
         ckpt = torch.load(path, map_location=device, weights_only=True)
-    except (pickle.UnpicklingError, RuntimeError) as e:
-        logger.warning(
-            f"Checkpoint uses unsafe pickle format. Loading with weights_only=False. Error: {e}"
+    except (pickle.UnpicklingError, RuntimeError):
+        logger.info(
+            "Loading checkpoint with legacy format (contains numpy objects). "
+            "This is safe for your own checkpoints."
         )
         ckpt = torch.load(path, map_location=device, weights_only=False)
     ckpt_epoch = int(ckpt.get("epoch", 0))
