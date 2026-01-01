@@ -8,9 +8,8 @@ import os
 import time
 import warnings
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from threading import Lock
+from threading import Thread
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -293,35 +292,19 @@ class PseudoIDManager:
         batch_size = calculate_optimal_embed_batch_size(device)
 
         all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
-
-        # Split work across GPUs
-        images_per_gpu = (num_images + num_gpus - 1) // num_gpus
-        gpu_ranges = []
-        for gpu_id in range(num_gpus):
-            start = gpu_id * images_per_gpu
-            end = min(start + images_per_gpu, num_images)
-            if start < num_images:
-                gpu_ranges.append((gpu_id, start, end))
-
-        # Track per-GPU progress
-        gpu_progress = [[0, end - start] for _, start, end in gpu_ranges]
-        progress_lock = Lock()
         start_time = time.perf_counter()
 
-        # Use GPU 0 for all embedding (model replication has device placement issues)
-        # k-NN step uses multi-GPU shards for parallelism
-        backbones = {0: model.backbone_k}
-        gpu_ranges = [(0, 0, num_images)]
-        gpu_progress = [[0, num_images]]
+        # Use the local rank's device for embedding (model is already on `device`)
+        # k-NN step uses multi-GPU FAISS shards for parallelism
+        backbone = model.backbone_k
 
-        def process_gpu(gpu_id: int, start: int, end: int) -> None:
-            gpu_device = torch.device(f"cuda:{gpu_id}")
-            backbone = backbones[gpu_id]
-            gpu_num_images = end - start
-            gpu_batches = (gpu_num_images + batch_size - 1) // batch_size
+        def process_embedding(start: int, end: int) -> None:
+            nonlocal gpu_progress
+            num_to_process = end - start
+            num_batches = (num_to_process + batch_size - 1) // batch_size
 
             with torch.no_grad(), torch.amp.autocast("cuda"):
-                for batch_idx in range(gpu_batches):
+                for batch_idx in range(num_batches):
                     b_start = start + batch_idx * batch_size
                     b_end = min(b_start + batch_size, end)
 
@@ -329,51 +312,44 @@ class PseudoIDManager:
                     if not batch_slice.flags["C_CONTIGUOUS"]:
                         batch_slice = np.ascontiguousarray(batch_slice)
 
-                    batch_gpu = torch.from_numpy(batch_slice).to(gpu_device, non_blocking=True)
-                    batch_gpu = batch_gpu.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
-                    emb = l2_normalize(backbone(batch_gpu), dim=1)
+                    batch_tensor = torch.from_numpy(batch_slice).to(device, non_blocking=True)
+                    batch_tensor = batch_tensor.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
+                    emb = l2_normalize(backbone(batch_tensor), dim=1)
                     all_embeddings[b_start:b_end] = emb.cpu()
-                    del batch_gpu, emb
+                    del batch_tensor, emb
 
-                    with progress_lock:
-                        gpu_progress[gpu_id][0] = b_end - start
+                    gpu_progress[0][0] = b_end - start
 
-        # Run with live progress display
-        if is_main and num_gpus > 1:
-            with Live(_make_gpu_progress_table([(0, t) for _, t in gpu_progress], "[1/4] EMBEDDING"),
+        # Run embedding with progress display (single GPU per rank)
+        gpu_progress = [[0, num_images]]
+        if is_main:
+            with Live(_make_gpu_progress_table([(0, num_images)], "[1/4] EMBEDDING"),
                       console=_console, refresh_per_second=4) as live:
-                with ThreadPoolExecutor(max_workers=num_gpus) as executor:
-                    futures = [executor.submit(process_gpu, gpu_id, start, end)
-                               for gpu_id, start, end in gpu_ranges]
-                    while not all(f.done() for f in futures):
-                        elapsed = time.perf_counter() - start_time
-                        total_done = sum(p[0] for p in gpu_progress)
-                        ips = int(total_done / elapsed) if elapsed > 0 else 0
-                        live.update(_make_gpu_progress_table(
-                            [(p[0], p[1]) for p in gpu_progress],
-                            "[1/4] EMBEDDING",
-                            f"{ips:,} img/s"
-                        ))
-                        time.sleep(0.1)
-                    # Final update
+                # Run in background thread so we can update progress
+                embed_thread = Thread(target=process_embedding, args=(0, num_images))
+                embed_thread.start()
+                while embed_thread.is_alive():
                     elapsed = time.perf_counter() - start_time
-                    total_done = sum(p[0] for p in gpu_progress)
-                    ips = int(total_done / elapsed) if elapsed > 0 else 0
+                    done = gpu_progress[0][0]
+                    ips = int(done / elapsed) if elapsed > 0 else 0
                     live.update(_make_gpu_progress_table(
-                        [(p[0], p[1]) for p in gpu_progress],
-                        "[1/4] EMBEDDING ✓",
+                        [(done, num_images)],
+                        "[1/4] EMBEDDING",
                         f"{ips:,} img/s"
                     ))
+                    time.sleep(0.1)
+                embed_thread.join()
+                # Final update
+                elapsed = time.perf_counter() - start_time
+                ips = int(num_images / elapsed) if elapsed > 0 else 0
+                live.update(_make_gpu_progress_table(
+                    [(num_images, num_images)],
+                    "[1/4] EMBEDDING ✓",
+                    f"{ips:,} img/s"
+                ))
         else:
-            # Single GPU or non-main process - run without fancy display
-            for gpu_id, start, end in gpu_ranges:
-                process_gpu(gpu_id, start, end)
-
-        # Cleanup replicated backbones
-        for gpu_id in backbones:
-            if gpu_id != 0:
-                del backbones[gpu_id]
-        torch.cuda.empty_cache()
+            # Non-main process - run without display
+            process_embedding(0, num_images)
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
