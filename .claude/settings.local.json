@@ -21,7 +21,15 @@
       "Bash(dir \"C:\\\\Users\\\\ariel\\\\face-rego\\\\data\\\\*.parquet\")",
       "Bash(python -c:*)",
       "Bash(cat:*)",
-      "Bash(aws s3 rm:*)"
+      "Bash(aws s3 rm:*)",
+      "Bash(uv run:*)",
+      "Bash(cmd /c \"uv run main.py data.data_fraction=0.01\")",
+      "Bash(tree:*)",
+      "Bash(ssh -o StrictHostKeyChecking=no root@213.173.102.207 -p 20252 \"echo ''SSH Connection successful!''; whoami; pwd\")",
+      "Bash(ssh -o StrictHostKeyChecking=no root@213.173.102.207 -p 14960 \"echo ''Connected!''; nvidia-smi --query-gpu=name,memory.total --format=csv; python3 --version\")",
+      "Bash(ssh -o StrictHostKeyChecking=no root@213.173.102.207 -p 14960 \"cd /workspace/face-reco && export PATH=\"\"$HOME/.local/bin:$PATH\"\" && export UV_CACHE_DIR=\"\"/root/.uv_cache\"\" && export UV_PROJECT_ENVIRONMENT=\"\"/root/venv\"\" && echo ''=== Starting Training ==='' && uv run main.py data.binary_cache_path=/dev/shm/images.npy\")",
+      "Bash(ssh -o StrictHostKeyChecking=no root@213.173.102.207 -p 14960 \"cd /workspace/face-reco && export UV_CACHE_DIR=/root/.uv_cache && export UV_PROJECT_ENVIRONMENT=/root/venv && export WANDB_MODE=disabled && echo ''=== Starting Training ==='' && /root/.local/bin/uv run main.py data.binary_cache_path=/dev/shm/images.npy wandb.enabled=false\")",
+      "Bash(ssh -o StrictHostKeyChecking=no root@213.173.102.207 -p 14960:*)"
     ]
   }
 }
