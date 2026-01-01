@@ -325,14 +325,21 @@ class PseudoIDManager:
                 pass  # Silently fall back to CPU
 
             if use_gpu:
-                # Use single GPU to avoid OOM when training also uses GPU memory
-                # Multi-GPU replicates the entire index on each GPU (2.5GB+)
-                _log(f"FAISS: GPU 0 (of {num_gpus})")
+                # Clear GPU memory before FAISS to avoid OOM
+                # Multi-GPU mode replicates the index (~2.5GB) on each GPU
+                for i in range(num_gpus):
+                    with torch.cuda.device(i):
+                        torch.cuda.empty_cache()
+
+                _log(f"FAISS: {num_gpus} GPU(s)")
                 t0 = time.perf_counter()
                 index = faiss.IndexFlatIP(embed_dim)
-                gpu_resources = faiss.StandardGpuResources()
-                gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
-                index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
+                if num_gpus > 1:
+                    index = faiss.index_cpu_to_all_gpus(index)
+                else:
+                    gpu_resources = faiss.StandardGpuResources()
+                    gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
+                    index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
 
                 index.add(embeddings)
                 add_time = time.perf_counter() - t0
