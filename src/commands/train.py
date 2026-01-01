@@ -342,13 +342,19 @@ def cmd_train(cfg: DictConfig) -> None:
         raise ValueError("Binary cache required: data.binary_cache_path")
 
     input_size = tuple(cfg.model.backbone.input_size)
-    num_workers = int(data_cfg.get("num_workers", 4))
+    num_workers = int(data_cfg.get("num_workers", 8))
+    prefetch_factor = int(data_cfg.get("prefetch_factor", 4))
+    data_fraction = float(data_cfg.get("data_fraction", 1.0))
+    if not 0.0 < data_fraction <= 1.0:
+        raise ValueError(f"data_fraction must be in (0, 1], got {data_fraction}")
 
     logger.info(f"Using binary cache: {binary_cache}")
     t_q = build_album_transform(cfg.augmentation.view_1, input_size=input_size)
     t_k = build_album_transform(cfg.augmentation.view_2, input_size=input_size)
     digiface_ds = data.BinaryImageDataset(binary_cache, t_q, t_k, seed=seed)
-    base_samples = len(digiface_ds)
+    base_samples = int(len(digiface_ds) * data_fraction)
+    if data_fraction < 1.0:
+        logger.info(f"Using {data_fraction:.1%} of data: {base_samples:,} samples")
 
     num_batches, num_samples = compute_epoch_batch_counts(
         base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
@@ -427,27 +433,25 @@ def cmd_train(cfg: DictConfig) -> None:
                     device,
                     batch_size,
                     num_workers,
+                    max_images=base_samples,
                 )
                 if wandb_active and dist_ctx.is_main:
                     log_wandb(stats, step=global_step)
                 if reset_queue:
-                    moco.reset_queue()  # Build epoch dataset (binary mode with optional pseudo-ID)
-                # Binary mode with pseudo-ID support
-                base_ds = data.BinaryMixDataset(
-                    digiface_ds, None, 1.0, num_samples, seed + epoch * 17
+                    moco.reset_queue()
+
+            # Build epoch dataset (binary mode with optional pseudo-ID)
+            base_ds = data.BinaryMixDataset(
+                digiface_ds, None, 1.0, num_samples, seed + epoch * 17
+            )
+            use_pseudo = pseudo_mgr and pseudo_mgr.state is not None and p_pseudo > 0
+            epoch_ds = (
+                data.PseudoPairTwoViewDataset(
+                    base_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17
                 )
-                use_pseudo = pseudo_mgr and pseudo_mgr.state is not None and p_pseudo > 0
-                epoch_ds = (
-                    data.PseudoPairTwoViewDataset(
-                        base_ds, pseudo_mgr, t_q, t_k, p_pseudo, num_samples, seed + epoch * 17
-                    )
-                    if use_pseudo
-                    else base_ds
-                )
-            else:
-                raise ValueError(
-                    "Parquet mode removed - use binary cache. Run: uv run python src/commands/fast_convert.py"
-                )
+                if use_pseudo
+                else base_ds
+            )
 
             loader_kw = {
                 "batch_size": batch_size,
@@ -456,7 +460,7 @@ def cmd_train(cfg: DictConfig) -> None:
                 "drop_last": True,
             }
             if num_workers > 0:
-                loader_kw.update(persistent_workers=True, prefetch_factor=2)
+                loader_kw.update(persistent_workers=True, prefetch_factor=prefetch_factor)
                 # Use fork for binary mode (COW memory sharing)
                 if supports_fork():
                     loader_kw["multiprocessing_context"] = "fork"
