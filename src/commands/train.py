@@ -15,7 +15,6 @@ from omegaconf import DictConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import SGD
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 import wandb
 from src import data
@@ -35,6 +34,7 @@ from src.schedule import (
 )
 from src.utils import (
     DistributedContext,
+    TrainingDisplay,
     cleanup_distributed,
     compute_epoch_batch_counts,
     configure_precision,
@@ -472,16 +472,19 @@ def cmd_train(cfg: DictConfig) -> None:
             epoch_start = time.perf_counter()
             img_count = 0
 
-            # Determine training phase for display
-            phase = "A:Stabilize" if epoch < 5 else "B:Bootstrap" if epoch < 35 else "C:Refine"
-            pbar = tqdm(
-                loader,
-                total=num_batches,
-                desc=f"Epoch {epoch:03d} [{phase}]",
-                unit="batch",
-                disable=not dist_ctx.is_main,
-            )  # Only show progress on main process
-            for step, batch in enumerate(pbar):
+            # Get model config for display
+            moco_cfg = get_moco().cfg
+
+            # Initialize rich training display
+            display = TrainingDisplay(
+                world_size=dist_ctx.world_size,
+                is_main=dist_ctx.is_main,
+                refresh_rate=4.0,
+            )
+            display.set_epoch_start(epoch_start, train_start)
+            display.start()
+
+            for step, batch in enumerate(loader):
                 # Unpack batch
                 if use_pseudo and len(batch) == 3:
                     im_q, im_k, cids = batch
@@ -558,15 +561,35 @@ def cmd_train(cfg: DictConfig) -> None:
                     m.update(log_gpu_memory())
                     log_wandb(m, step=global_step)
 
-                # Update progress bar with avg img/s
-                now = time.perf_counter()
-                avg_ips = img_count / (now - epoch_start) if now > epoch_start else 0
-                pbar.set_postfix(
-                    loss=f"{stats['loss']:.4f}",
-                    pos=f"{stats['pos_sim']:.3f}",
-                    neg=f"{stats['neg_sim']:.3f}",
-                    ips=f"{avg_ips:.0f}",
+                # Update rich display panel
+                clustered_pct = 0.0
+                num_clusters = 0
+                if pseudo_mgr and pseudo_mgr.state:
+                    num_clusters = pseudo_mgr.num_clusters
+                    clustered_pct = (
+                        pseudo_mgr.state.num_clustered / pseudo_mgr.state.num_images
+                        if pseudo_mgr.state.num_images > 0
+                        else 0.0
+                    )
+
+                display.update(
+                    step=step,
+                    total_steps=num_batches,
+                    stats=stats,
+                    lr=lr,
+                    grad_norm=float(grad_norm),
+                    img_count=img_count,
+                    epoch=epoch,
+                    pseudo_prob=p_pseudo,
+                    num_clusters=num_clusters,
+                    clustered_pct=clustered_pct,
+                    temperature=moco_cfg.temperature,
+                    margin=moco_cfg.margin,
+                    queue_size=moco_cfg.queue_size,
                 )
+
+            # Stop display before epoch summary
+            display.stop()
 
             # Epoch summary (main process only for logging)
             elapsed = time.perf_counter() - epoch_start

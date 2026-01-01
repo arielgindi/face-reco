@@ -16,9 +16,11 @@ from src.utils.platform import (
     supports_fork,
     supports_torch_compile,
 )
+from src.utils.training_display import TrainingDisplay
 
 __all__ = [
     "DistributedContext",
+    "TrainingDisplay",
     "cleanup_distributed",
     "compute_epoch_batch_counts",
     "configure_precision",
