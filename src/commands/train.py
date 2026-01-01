@@ -355,9 +355,13 @@ def cmd_train(cfg: DictConfig) -> None:
     if data_fraction < 1.0:
         logger.info(f"Using {data_fraction:.1%} of data: {base_samples:,} samples")
 
+    # Each GPU processes base_samples/world_size due to IterableDataset sharding
+    samples_per_rank = base_samples // dist_ctx.world_size if dist_ctx.enabled else base_samples
     num_batches, num_samples = compute_epoch_batch_counts(
-        base_samples=base_samples, batch_size=batch_size, grad_accum_steps=grad_accum
+        base_samples=samples_per_rank, batch_size=batch_size, grad_accum_steps=grad_accum
     )
+    # num_samples is per-rank; total across all GPUs is still base_samples
+    total_samples = base_samples
 
     # Log config summary (main process only)
     if dist_ctx.is_main:
@@ -381,7 +385,7 @@ def cmd_train(cfg: DictConfig) -> None:
         logger.info(
             f"Training: {start_epoch}->{train.epochs - 1} epochs | batch={effective_batch} | lr={train.optimizer.lr}"
         )
-        logger.info(f"Data: {num_samples:,} samples/epoch")
+        logger.info(f"Data: {total_samples:,} samples/epoch ({num_batches:,} steps/GPU)")
         if pseudo.get("enabled"):
             logger.info(
                 f"Pseudo-ID: k={pseudo.get('knn_k', 20)} mutual={pseudo.get('mutual_topk', 5)}"
