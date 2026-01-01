@@ -309,18 +309,18 @@ class PseudoIDManager:
         start_time = time.perf_counter()
 
         # Replicate backbone_k to all GPUs
-        # Strategy: get state_dict, create model on CPU via deepcopy, then move to target GPU
-        original_state = model.backbone_k.state_dict()
+        # Clone state dict to CPU first, then load into fresh copies on each GPU
+        cpu_state = {k: v.detach().cpu().clone() for k, v in model.backbone_k.state_dict().items()}
         backbones = {}
         for gpu_id, _, _ in gpu_ranges:
             if gpu_id == 0:
                 backbones[0] = model.backbone_k
             else:
                 target_device = torch.device(f"cuda:{gpu_id}")
-                # Create a fresh copy: deepcopy to CPU, load state, then move to target GPU
-                with torch.device("cpu"):
-                    backbone_copy = copy.deepcopy(model.backbone_k).cpu()
-                backbone_copy.load_state_dict(original_state)
+                # Deepcopy model structure, move to CPU, load CPU state, then move to target
+                backbone_copy = copy.deepcopy(model.backbone_k)
+                backbone_copy.to("cpu")
+                backbone_copy.load_state_dict(cpu_state)
                 backbone_copy.to(target_device)
                 backbone_copy.eval()
                 backbones[gpu_id] = backbone_copy
