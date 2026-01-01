@@ -31,7 +31,8 @@ uv run torchrun --nproc_per_node=3 -m src.commands.train \
   train.batch.grad_accum_steps=1 \
   train.optimizer.lr=0.03 \
   train.lr_schedule.warmup.start_lr=0.003 \
-  hydra.run.dir=/tmp/hydra_outputs  # Avoid network FS quota issues
+  hydra.run.dir=/tmp/hydra_outputs \
+  wandb.enabled=false  # Disable W&B to avoid RunPod disk quota issues
 
 # Test with 1% data
 uv run torchrun --nproc_per_node=3 -m src.commands.train \
