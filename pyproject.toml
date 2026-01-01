@@ -8,7 +8,6 @@ dependencies = [
   "numpy",
   "pyyaml",
   "tqdm",
-  "faiss-cpu",
   "pillow",
   "wandb",
   "hydra-core",
@@ -19,9 +18,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # For 4070 Ti, 4090, A100, H100 (sm_89 and below)
-cu124 = ["torch", "torchvision"]
+cu124 = ["torch", "torchvision", "faiss-gpu-cu12"]
 # For Blackwell GPUs - RTX 5090, PRO 6000 (sm_120)
-cu128 = ["torch", "torchvision"]
+cu128 = ["torch", "torchvision", "faiss-gpu-cu12"]
 
 [tool.uv]
 # Tell uv these extras are mutually exclusive
