@@ -325,23 +325,38 @@ class PseudoIDManager:
                 pass  # Silently fall back to CPU
 
             if use_gpu:
-                # Clear GPU memory before FAISS to avoid OOM
-                # Multi-GPU mode replicates the index (~2.5GB) on each GPU
+                # Clear GPU memory before FAISS
                 for i in range(num_gpus):
                     with torch.cuda.device(i):
                         torch.cuda.empty_cache()
 
-                _log(f"FAISS: {num_gpus} GPU(s)")
+                _log(f"FAISS: {num_gpus} GPU(s) sharded")
                 t0 = time.perf_counter()
-                index = faiss.IndexFlatIP(embed_dim)
+
                 if num_gpus > 1:
-                    index = faiss.index_cpu_to_all_gpus(index)
+                    # Shard index across GPUs - each GPU holds 1/N of vectors
+                    # This uses ~1/N memory per GPU vs replicating full index
+                    index = faiss.IndexShards(embed_dim, True, False)  # (dim, threaded, successive_ids)
+                    shard_size = (num_images + num_gpus - 1) // num_gpus
+
+                    for i in range(num_gpus):
+                        gpu_res = faiss.StandardGpuResources()
+                        gpu_res.setTempMemory(self.faiss_temp_memory_gb << 30)
+                        sub_index = faiss.IndexFlatIP(embed_dim)
+                        gpu_index = faiss.index_cpu_to_gpu(gpu_res, i, sub_index)
+
+                        # Add shard of vectors to this GPU
+                        start = i * shard_size
+                        end = min(start + shard_size, num_images)
+                        if start < num_images:
+                            gpu_index.add(embeddings[start:end])
+                        index.add_shard(gpu_index)
                 else:
                     gpu_resources = faiss.StandardGpuResources()
                     gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
-                    index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
+                    index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss.IndexFlatIP(embed_dim))
+                    index.add(embeddings)
 
-                index.add(embeddings)
                 add_time = time.perf_counter() - t0
                 _log(f"Added {num_images:,} vectors in {add_time:.1f}s")
 
