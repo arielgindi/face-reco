@@ -308,22 +308,11 @@ class PseudoIDManager:
         progress_lock = Lock()
         start_time = time.perf_counter()
 
-        # Replicate backbone_k to all GPUs
-        # Clone state dict to CPU first, then load into fresh copies on each GPU
-        cpu_state = {k: v.detach().cpu().clone() for k, v in model.backbone_k.state_dict().items()}
-        backbones = {}
-        for gpu_id, _, _ in gpu_ranges:
-            if gpu_id == 0:
-                backbones[0] = model.backbone_k
-            else:
-                target_device = torch.device(f"cuda:{gpu_id}")
-                # Deepcopy model structure, move to CPU, load CPU state, then move to target
-                backbone_copy = copy.deepcopy(model.backbone_k)
-                backbone_copy.to("cpu")
-                backbone_copy.load_state_dict(cpu_state)
-                backbone_copy.to(target_device)
-                backbone_copy.eval()
-                backbones[gpu_id] = backbone_copy
+        # Use GPU 0 for all embedding (model replication has device placement issues)
+        # k-NN step uses multi-GPU shards for parallelism
+        backbones = {0: model.backbone_k}
+        gpu_ranges = [(0, 0, num_images)]
+        gpu_progress = [[0, num_images]]
 
         def process_gpu(gpu_id: int, start: int, end: int) -> None:
             gpu_device = torch.device(f"cuda:{gpu_id}")
