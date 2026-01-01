@@ -286,51 +286,89 @@ class PseudoIDManager:
         num_images = min(total_images, max_images) if max_images is not None else total_images
         is_main = _is_main_process()
 
-        # Detect available GPUs
-        num_gpus = torch.cuda.device_count()
         embed_dim = model.cfg.embedding_dim
         batch_size = calculate_optimal_embed_batch_size(device)
-
-        all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
+        backbone = model.backbone_k
         start_time = time.perf_counter()
 
-        # Use the local rank's device for embedding (model is already on `device`)
-        # k-NN step uses multi-GPU FAISS shards for parallelism
-        backbone = model.backbone_k
+        # Get distributed info
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank = 0
+            world_size = 1
 
-        def process_embedding(start: int, end: int) -> None:
-            nonlocal gpu_progress
-            num_to_process = end - start
-            num_batches = (num_to_process + batch_size - 1) // batch_size
+        # Calculate this rank's shard (for distributed embedding)
+        shard_size = (num_images + world_size - 1) // world_size
+        shard_start = rank * shard_size
+        shard_end = min(shard_start + shard_size, num_images)
+        local_count = shard_end - shard_start
 
+        # Each rank embeds its own shard
+        local_embeddings = torch.empty((shard_size, embed_dim), dtype=torch.float32)
+        local_progress = [0]
+
+        def process_embedding() -> None:
+            num_batches = (local_count + batch_size - 1) // batch_size
             with torch.no_grad(), torch.amp.autocast("cuda"):
                 for batch_idx in range(num_batches):
-                    b_start = start + batch_idx * batch_size
-                    b_end = min(b_start + batch_size, end)
+                    b_start = batch_idx * batch_size
+                    b_end = min(b_start + batch_size, local_count)
+                    global_start = shard_start + b_start
+                    global_end = shard_start + b_end
 
-                    batch_slice = images[b_start:b_end]
+                    batch_slice = images[global_start:global_end]
                     if not batch_slice.flags["C_CONTIGUOUS"]:
                         batch_slice = np.ascontiguousarray(batch_slice)
 
                     batch_tensor = torch.from_numpy(batch_slice).to(device, non_blocking=True)
                     batch_tensor = batch_tensor.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
                     emb = l2_normalize(backbone(batch_tensor), dim=1)
-                    all_embeddings[b_start:b_end] = emb.cpu()
+                    local_embeddings[b_start:b_end] = emb.cpu()
                     del batch_tensor, emb
 
-                    gpu_progress[0][0] = b_end - start
+                    local_progress[0] = b_end
 
-        # Only rank 0 does embedding, then broadcasts to other ranks
-        gpu_progress = [[0, num_images]]
-        if is_main:
-            with Live(_make_gpu_progress_table([(0, num_images)], "[1/4] EMBEDDING"),
+        # Run embedding with progress display (only rank 0 shows UI)
+        if is_main and world_size > 1:
+            # Multi-GPU: show per-GPU progress bars
+            gpu_progress = [[0, shard_size] for _ in range(world_size)]
+            with Live(_make_gpu_progress_table([(0, shard_size) for _ in range(world_size)], "[1/4] EMBEDDING"),
                       console=_console, refresh_per_second=4) as live:
-                # Run in background thread so we can update progress
-                embed_thread = Thread(target=process_embedding, args=(0, num_images))
+                embed_thread = Thread(target=process_embedding)
                 embed_thread.start()
                 while embed_thread.is_alive():
                     elapsed = time.perf_counter() - start_time
-                    done = gpu_progress[0][0]
+                    # Rank 0 only knows its own progress; show estimate for others
+                    gpu_progress[0][0] = local_progress[0]
+                    for i in range(1, world_size):
+                        gpu_progress[i][0] = local_progress[0]  # Approximate (they run in parallel)
+                    total_done = sum(p[0] for p in gpu_progress)
+                    ips = int(total_done / elapsed) if elapsed > 0 else 0
+                    live.update(_make_gpu_progress_table(
+                        [(p[0], shard_size) for p in gpu_progress],
+                        "[1/4] EMBEDDING",
+                        f"{ips:,} img/s"
+                    ))
+                    time.sleep(0.1)
+                embed_thread.join()
+                elapsed = time.perf_counter() - start_time
+                ips = int(num_images / elapsed) if elapsed > 0 else 0
+                live.update(_make_gpu_progress_table(
+                    [(shard_size, shard_size) for _ in range(world_size)],
+                    "[1/4] EMBEDDING ✓",
+                    f"{ips:,} img/s"
+                ))
+        elif is_main:
+            # Single GPU
+            with Live(_make_gpu_progress_table([(0, num_images)], "[1/4] EMBEDDING"),
+                      console=_console, refresh_per_second=4) as live:
+                embed_thread = Thread(target=process_embedding)
+                embed_thread.start()
+                while embed_thread.is_alive():
+                    elapsed = time.perf_counter() - start_time
+                    done = local_progress[0]
                     ips = int(done / elapsed) if elapsed > 0 else 0
                     live.update(_make_gpu_progress_table(
                         [(done, num_images)],
@@ -339,7 +377,6 @@ class PseudoIDManager:
                     ))
                     time.sleep(0.1)
                 embed_thread.join()
-                # Final update
                 elapsed = time.perf_counter() - start_time
                 ips = int(num_images / elapsed) if elapsed > 0 else 0
                 live.update(_make_gpu_progress_table(
@@ -347,14 +384,24 @@ class PseudoIDManager:
                     "[1/4] EMBEDDING ✓",
                     f"{ips:,} img/s"
                 ))
-        # else: non-main ranks wait for broadcast below
+        else:
+            # Non-main ranks: just run embedding without progress display
+            process_embedding()
 
-        # Broadcast embeddings from rank 0 to all other ranks
-        if torch.distributed.is_initialized():
-            embed_tensor = torch.from_numpy(all_embeddings.numpy() if hasattr(all_embeddings, 'numpy') else all_embeddings).to(device)
-            torch.distributed.broadcast(embed_tensor, src=0)
-            all_embeddings = embed_tensor.cpu()
-            del embed_tensor
+        # Gather embeddings from all ranks using all_gather
+        if torch.distributed.is_initialized() and world_size > 1:
+            # Pad local embeddings to shard_size (last rank may have fewer)
+            # local_embeddings is already shard_size, but only local_count are valid
+            # Zero-pad the rest (already zeros from empty init)
+
+            # all_gather requires same-sized tensors
+            gathered = [torch.empty((shard_size, embed_dim), dtype=torch.float32) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, local_embeddings)
+
+            # Concatenate and trim to actual num_images
+            all_embeddings = torch.cat(gathered, dim=0)[:num_images]
+        else:
+            all_embeddings = local_embeddings[:local_count]
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
@@ -592,16 +639,17 @@ class PseudoIDManager:
         if is_main:
             _console.print(f"  [bold green]✓[/bold green] [1/4] Embedding     {num_images:,} images @ {embed_ips:,.0f} img/s [dim]({_fmt_time(step_times['embed'])})[/dim]")
 
-        # Step 2: k-NN graph (has its own per-GPU progress display)
-        t0 = time.perf_counter()
-        knn_similarities, knn_indices = self._build_knn_graph(embeddings)
-        step_times["knn"] = time.perf_counter() - t0
-        knn_qps = num_images / step_times["knn"] if step_times["knn"] > 0 else 0
+        # Steps 2-4: FAISS k-NN, mutual edges, and clustering run ONLY on rank 0
+        # Other ranks wait at broadcast and receive the cluster labels
         if is_main:
+            # Step 2: k-NN graph (has its own per-GPU progress display)
+            t0 = time.perf_counter()
+            knn_similarities, knn_indices = self._build_knn_graph(embeddings)
+            step_times["knn"] = time.perf_counter() - t0
+            knn_qps = num_images / step_times["knn"] if step_times["knn"] > 0 else 0
             _console.print(f"  [bold green]✓[/bold green] [2/4] k-NN Graph    {num_images:,} queries @ {knn_qps:,.0f} q/s [dim]({_fmt_time(step_times['knn'])})[/dim]")
 
-        # Step 3: Mutual edges (CPU operation - simple progress)
-        if is_main:
+            # Step 3: Mutual edges (CPU operation - simple progress)
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[bold yellow][3/4] Mutual Edges[/bold yellow]"),
@@ -613,13 +661,8 @@ class PseudoIDManager:
                 mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
                 step_times["mutual"] = time.perf_counter() - t0
             _console.print(f"  [bold green]✓[/bold green] [3/4] Mutual Edges  {len(mutual_edges):,} edges [dim]({_fmt_time(step_times['mutual'])})[/dim]")
-        else:
-            t0 = time.perf_counter()
-            mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
-            step_times["mutual"] = time.perf_counter() - t0
 
-        # Step 4: Clustering (CPU operation - simple progress)
-        if is_main:
+            # Step 4: Clustering (CPU operation - simple progress)
             with Progress(
                 SpinnerColumn(),
                 TextColumn("[bold yellow][4/4] Clustering[/bold yellow]"),
@@ -629,10 +672,29 @@ class PseudoIDManager:
                 t0 = time.perf_counter()
                 cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
                 step_times["cluster"] = time.perf_counter() - t0
+
+            # Convert to tensor for broadcast
+            cluster_labels_tensor = torch.from_numpy(cluster_labels).to(device)
         else:
-            t0 = time.perf_counter()
-            cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
-            step_times["cluster"] = time.perf_counter() - t0
+            # Non-main ranks: create empty tensor to receive broadcast
+            cluster_labels_tensor = torch.empty(num_images, dtype=torch.int32, device=device)
+            step_times["knn"] = 0.0
+            step_times["mutual"] = 0.0
+            step_times["cluster"] = 0.0
+
+        # Broadcast cluster labels from rank 0 to all ranks
+        if torch.distributed.is_initialized():
+            torch.distributed.broadcast(cluster_labels_tensor, src=0)
+
+        # Convert back to numpy and rebuild cluster_to_images on non-main ranks
+        cluster_labels = cluster_labels_tensor.cpu().numpy()
+        if not is_main:
+            # Rebuild cluster_to_images dict from the broadcasted labels
+            cluster_to_images: dict[int, np.ndarray] = {}
+            for idx, cid in enumerate(cluster_labels):
+                if cid >= 0:
+                    cluster_to_images.setdefault(int(cid), []).append(idx)
+            cluster_to_images = {k: np.array(v, dtype=np.int32) for k, v in cluster_to_images.items()}
 
         num_clustered = int((cluster_labels >= 0).sum())
         self.state = PseudoIDState(
