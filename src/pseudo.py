@@ -308,15 +308,20 @@ class PseudoIDManager:
         progress_lock = Lock()
         start_time = time.perf_counter()
 
-        # Replicate backbone_k to all GPUs
+        # Replicate backbone_k to all GPUs using state_dict for reliable device placement
         backbones = {}
         for gpu_id, _, _ in gpu_ranges:
             if gpu_id == 0:
                 backbones[0] = model.backbone_k
             else:
-                # Deep copy and move to target GPU
-                backbones[gpu_id] = copy.deepcopy(model.backbone_k).to(f"cuda:{gpu_id}")
-                backbones[gpu_id].eval()
+                target_device = torch.device(f"cuda:{gpu_id}")
+                # Deep copy structure, then explicitly move ALL tensors via state_dict
+                backbone_copy = copy.deepcopy(model.backbone_k)
+                state_dict = {k: v.to(target_device) for k, v in model.backbone_k.state_dict().items()}
+                backbone_copy.load_state_dict(state_dict)
+                backbone_copy.to(target_device)  # Ensure any non-state-dict attrs are moved too
+                backbone_copy.eval()
+                backbones[gpu_id] = backbone_copy
 
         def process_gpu(gpu_id: int, start: int, end: int) -> None:
             gpu_device = torch.device(f"cuda:{gpu_id}")
