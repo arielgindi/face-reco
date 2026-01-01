@@ -674,3 +674,17 @@ def cmd_train(cfg: DictConfig) -> None:
 
         # Clean up distributed
         cleanup_distributed()
+
+
+if __name__ == "__main__":
+    import hydra
+    from hydra.core.global_hydra import GlobalHydra
+
+    # Clear any previous Hydra state
+    GlobalHydra.instance().clear()
+
+    @hydra.main(config_path="../../conf", config_name="config", version_base=None)
+    def main(cfg: DictConfig) -> None:
+        cmd_train(cfg)
+
+    main()
