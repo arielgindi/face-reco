@@ -61,6 +61,10 @@ def init_wandb(cfg: DictConfig, out_dir: Path) -> bool:
     system_info = get_system_info()
     config_dict["system"] = system_info
 
+    # Use /tmp for W&B data to avoid disk quota issues on network FS
+    wandb_dir = Path("/tmp/wandb_run")
+    wandb_dir.mkdir(parents=True, exist_ok=True)
+
     wandb.init(
         project=wandb_cfg.get("project", "sniperface"),
         entity=wandb_cfg.get("entity"),
@@ -68,7 +72,7 @@ def init_wandb(cfg: DictConfig, out_dir: Path) -> bool:
         tags=list(wandb_cfg.get("tags", [])),
         notes=wandb_cfg.get("notes"),
         config=config_dict,
-        dir=str(out_dir),
+        dir=str(wandb_dir),
         resume="allow",
     )
 

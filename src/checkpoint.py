@@ -109,8 +109,9 @@ def save_checkpoint(
     cfg: DictConfig,
     pseudo_manager: Any = None,
 ) -> Path:
-    """Save a training checkpoint."""
-    ckpt_dir = out_dir / "checkpoints"
+    """Save a training checkpoint to /tmp to avoid disk quota issues."""
+    # Always use /tmp for checkpoint writes to avoid network FS quota issues
+    ckpt_dir = Path("/tmp/checkpoints")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     path = ckpt_dir / f"epoch_{epoch:03d}.pt"
 
@@ -130,8 +131,10 @@ def save_checkpoint(
 
 
 def prune_checkpoints(ckpt_dir: Path, keep_last: int) -> None:
-    """Keep only the newest N checkpoints."""
-    if keep_last <= 0:
+    """Keep only the newest N checkpoints in /tmp."""
+    # Always use /tmp for checkpoint storage
+    ckpt_dir = Path("/tmp/checkpoints")
+    if keep_last <= 0 or not ckpt_dir.exists():
         return
     ckpts = sorted(ckpt_dir.glob("epoch_*.pt"))
     if len(ckpts) <= keep_last:
