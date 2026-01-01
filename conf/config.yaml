@@ -60,6 +60,10 @@ data:
   # Path to binary cache file (pre-decoded images in .npy format)
   binary_cache_path: "data/images.npy"
 
+  # Fraction of data to use (0.0-1.0). Useful for quick debugging/testing.
+  # Example: 0.01 = 1% of data, 0.1 = 10%, 1.0 = full dataset
+  data_fraction: 1.0
+
   # Dataset splitting configuration
   split:
     train_ratio: 0.75  # Fraction of data for training (0.75 = 75% train, 25% test)
@@ -91,6 +95,18 @@ data:
     # Formula: worker_seed = base_seed + worker_id * seed_offset
     # Must be a large prime number to avoid correlation between workers
     worker_seed_offset: 7919
+
+  # DataLoader workers for parallel data loading
+  # More workers = faster data loading (diminishing returns after 8)
+  # Windows: 6-8 workers recommended (spawn overhead is higher than fork)
+  # Linux: 8-12 workers (fork is cheaper)
+  # Set to 0 to disable multiprocessing (single-threaded)
+  num_workers: 8
+
+  # Number of batches to prefetch per worker
+  # Higher = more memory usage but better pipeline utilization
+  # Range: 2-8, sweet spot is usually 4-6
+  prefetch_factor: 4
 
 # =============================================================================
 # Model Architecture
