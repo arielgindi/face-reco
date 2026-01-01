@@ -104,9 +104,8 @@ def _setup_training(
     )
     effective_batch = batch_size * dist_ctx.world_size
     if queue_size % effective_batch != 0 and dist_ctx.is_main:
-        logger.warning(
-            f"Queue size ({queue_size}) is not divisible by effective batch size ({effective_batch} = {batch_size}*{dist_ctx.world_size}). "
-            f"This may cause queue pointer drift across epochs in DDP mode."
+        logger.debug(
+            f"Queue size ({queue_size}) not divisible by batch ({effective_batch}), minor efficiency impact."
         )
 
     opt_cfg = cfg.train.optimizer

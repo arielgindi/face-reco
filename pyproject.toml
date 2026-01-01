@@ -8,6 +8,7 @@ dependencies = [
   "numpy",
   "pyyaml",
   "tqdm",
+  "rich",
   "pillow",
   "wandb",
   "hydra-core",

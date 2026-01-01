@@ -79,10 +79,7 @@ def load_checkpoint_for_resume(
     try:
         ckpt = torch.load(path, map_location=device, weights_only=True)
     except (pickle.UnpicklingError, RuntimeError):
-        logger.info(
-            "Loading checkpoint with legacy format (contains numpy objects). "
-            "This is safe for your own checkpoints."
-        )
+        # Legacy checkpoint with numpy objects - load without weights_only restriction
         ckpt = torch.load(path, map_location=device, weights_only=False)
     ckpt_epoch = int(ckpt.get("epoch", 0))
     ckpt_state = _filter_warm_start_state(ckpt["model"]) if warm_start else ckpt["model"]

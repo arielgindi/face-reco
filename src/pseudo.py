@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import logging
-import sys
+import os
 import time
+import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.table import Table
 from torch.utils.data import DataLoader, Dataset
-from tqdm import tqdm
 
 if TYPE_CHECKING:
     from src.model import MoCo
@@ -21,6 +25,19 @@ from src.data.binary_dataset import BinaryImageDataset
 from src.utils.platform import get_optimal_batch_size
 
 logger = logging.getLogger(__name__)
+
+# Suppress PyTorch warning about non-writable numpy arrays (we use read-only mmap intentionally)
+warnings.filterwarnings("ignore", message=".*given NumPy array is not writable.*")
+
+
+def _is_main_process() -> bool:
+    """Check if this is the main process (rank 0) in distributed training."""
+    rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    return rank == 0
+
+
+# Rich console - only outputs on main process
+_console = Console(force_terminal=True, highlight=False)
 
 
 def _fmt_time(seconds: float) -> str:
@@ -231,8 +248,9 @@ class PseudoIDManager:
 
         total_images = len(images)
         num_images = min(total_images, max_images) if max_images is not None else total_images
+        is_main = _is_main_process()
 
-        if max_images is not None and num_images < total_images:
+        if max_images is not None and num_images < total_images and is_main:
             logger.info(f"        Subset: {num_images:,}/{total_images:,} ({num_images/total_images:.1%})")
 
         embed_dim = model.cfg.embedding_dim
@@ -241,41 +259,59 @@ class PseudoIDManager:
         all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
         total_batches = (num_images + batch_size - 1) // batch_size
 
-        pbar = tqdm(
-            range(total_batches),
-            desc=f"        Embed (bs={batch_size})",
-            unit="batch",
-            ncols=100,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
+        # Only show progress on main process
+        progress = Progress(
+            SpinnerColumn(),
+            TextColumn("[bold blue]Embedding"),
+            BarColumn(bar_width=40),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TextColumn("•"),
+            TextColumn("{task.completed:,}/{task.total:,}"),
+            TextColumn("•"),
+            TimeElapsedColumn(),
+            TextColumn("→"),
+            TimeRemainingColumn(),
+            TextColumn("•"),
+            TextColumn("[cyan]{task.fields[ips]:,} img/s"),
+            console=_console,
+            disable=not is_main,
         )
 
-        with torch.no_grad(), torch.amp.autocast("cuda"):
-            for batch_idx in pbar:
-                start_idx = batch_idx * batch_size
-                end_idx = min(start_idx + batch_size, num_images)
+        with progress:
+            task = progress.add_task("embed", total=num_images, ips=0)
 
-                # Zero-copy mmap access
-                batch_slice = images[start_idx:end_idx]
-                if not batch_slice.flags["C_CONTIGUOUS"]:
-                    batch_slice = np.ascontiguousarray(batch_slice)
+            with torch.no_grad(), torch.amp.autocast("cuda"):
+                for batch_idx in range(total_batches):
+                    start_idx = batch_idx * batch_size
+                    end_idx = min(start_idx + batch_size, num_images)
 
-                batch_gpu = torch.from_numpy(batch_slice).to(device, non_blocking=True)
-                # Fused preprocessing
-                batch_gpu = batch_gpu.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
-                embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
-                all_embeddings[start_idx:end_idx] = embeddings.cpu()
-                del batch_gpu, embeddings
+                    # Zero-copy mmap access
+                    batch_slice = images[start_idx:end_idx]
+                    if not batch_slice.flags["C_CONTIGUOUS"]:
+                        batch_slice = np.ascontiguousarray(batch_slice)
 
-                # Update progress bar with images/sec
-                elapsed = time.perf_counter() - self._embed_start_time if self._embed_start_time else 1
-                ips = end_idx / elapsed if elapsed > 0 else 0
-                pbar.set_postfix({"img/s": f"{ips:,.0f}", "done": f"{end_idx:,}"}, refresh=True)
+                    batch_gpu = torch.from_numpy(batch_slice).to(device, non_blocking=True)
+                    # Fused preprocessing
+                    batch_gpu = batch_gpu.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
+                    embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
+                    all_embeddings[start_idx:end_idx] = embeddings.cpu()
+                    del batch_gpu, embeddings
+
+                    # Update progress with images/sec
+                    elapsed = time.perf_counter() - self._embed_start_time if self._embed_start_time else 1
+                    ips = int(end_idx / elapsed) if elapsed > 0 else 0
+                    progress.update(task, completed=end_idx, ips=ips)
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
     def _build_knn_graph(self, embeddings: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         num_images, embed_dim = embeddings.shape
         search_k = self.knn_k + 1
+        is_main = _is_main_process()
+
+        def _log(msg: str) -> None:
+            if is_main:
+                _console.print(f"        [dim]{msg}[/dim]")
 
         try:
             import faiss
@@ -285,50 +321,38 @@ class PseudoIDManager:
             try:
                 num_gpus = faiss.get_num_gpus()
                 use_gpu = num_gpus > 0
-            except Exception as e:
-                logger.warning(f"FAISS GPU check failed: {e}")
+            except Exception:
+                pass  # Silently fall back to CPU
 
             if use_gpu:
-                logger.info(f"        FAISS: {num_gpus} GPU(s) detected")
-                # Build index
+                # Use single GPU to avoid OOM when training also uses GPU memory
+                # Multi-GPU replicates the entire index on each GPU (2.5GB+)
+                _log(f"FAISS: GPU 0 (of {num_gpus})")
                 t0 = time.perf_counter()
                 index = faiss.IndexFlatIP(embed_dim)
-                if num_gpus > 1:
-                    # Use all GPUs for search
-                    index = faiss.index_cpu_to_all_gpus(index)
-                    logger.info(f"        Index: Multi-GPU ({num_gpus} GPUs)")
-                else:
-                    gpu_resources = faiss.StandardGpuResources()
-                    gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
-                    index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
-                    logger.info("        Index: Single GPU")
+                gpu_resources = faiss.StandardGpuResources()
+                gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
+                index = faiss.index_cpu_to_gpu(gpu_resources, 0, index)
 
-                # Add vectors with progress
-                logger.info(f"        Adding {num_images:,} vectors...")
                 index.add(embeddings)
                 add_time = time.perf_counter() - t0
-                logger.info(f"        Added in {add_time:.1f}s ({num_images/add_time:,.0f} vec/s)")
+                _log(f"Added {num_images:,} vectors in {add_time:.1f}s")
 
-                # Search with progress
-                logger.info(f"        Searching k={self.knn_k} neighbors...")
                 t0 = time.perf_counter()
                 similarities, indices = index.search(embeddings, search_k)
                 search_time = time.perf_counter() - t0
-                logger.info(f"        Search done in {search_time:.1f}s ({num_images/search_time:,.0f} query/s)")
+                _log(f"Searched k={self.knn_k} in {search_time:.1f}s ({num_images/search_time:,.0f} q/s)")
             else:
                 nlist = min(4096, num_images // 100)
                 quantizer = faiss.IndexFlatIP(embed_dim)
                 index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
                 index.nprobe = self.faiss_nprobe
-                logger.info(f"        FAISS-CPU: IVF nlist={nlist}, nprobe={self.faiss_nprobe}")
-                logger.info("        Training index...")
+                _log(f"FAISS-CPU: IVF nlist={nlist}")
                 index.train(embeddings)
-                logger.info("        Adding vectors...")
                 index.add(embeddings)
-                logger.info("        Searching...")
                 similarities, indices = index.search(embeddings, search_k)
         except ImportError:
-            logger.info("        Backend: sklearn (slow)")
+            _log("Backend: sklearn (slow)")
             from sklearn.neighbors import NearestNeighbors
             nn_model = NearestNeighbors(n_neighbors=search_k, metric="cosine").fit(embeddings)
             distances, indices = nn_model.kneighbors(embeddings)
@@ -407,14 +431,22 @@ class PseudoIDManager:
     ) -> dict[str, Any]:
         """Run pseudo-ID mining: embed -> kNN -> mutual filter -> cluster."""
         start_time = time.perf_counter()
-        step_times = {}
+        step_times: dict[str, float] = {}
+        step_results: dict[str, str] = {}
+        is_main = _is_main_process()
 
-        logger.info(f"{'='*60}")
-        logger.info(f"  PSEUDO-ID MINING | Epoch {epoch} | Threshold {sim_threshold:.2f}")
-        logger.info(f"{'='*60}")
+        # Header
+        if is_main:
+            _console.print()
+            _console.print(Panel(
+                f"[bold cyan]PSEUDO-ID MINING[/bold cyan]  •  Epoch {epoch}  •  Threshold {sim_threshold:.2f}",
+                style="blue",
+                padding=(0, 2),
+            ))
 
         # Step 1: Embedding
-        logger.info(f"  [1/4] EMBEDDING")
+        if is_main:
+            _console.print("  [bold yellow]►[/bold yellow] [1/4] Embedding...", end="")
         t0 = time.perf_counter()
         self._embed_start_time = t0
         embeddings, image_bytes_list = self._extract_embeddings(
@@ -423,24 +455,33 @@ class PseudoIDManager:
         num_images = len(embeddings)
         step_times["embed"] = time.perf_counter() - t0
         embed_ips = num_images / step_times["embed"] if step_times["embed"] > 0 else 0
-        logger.info(f"  [1/4] DONE: {num_images:,} images @ {embed_ips:,.0f} img/s ({_fmt_time(step_times['embed'])})")
+        step_results["embed"] = f"{num_images:,} images @ {embed_ips:,.0f} img/s"
+        if is_main:
+            _console.print(f"\r  [bold green]✓[/bold green] [1/4] Embedding     {step_results['embed']} [dim]({_fmt_time(step_times['embed'])})[/dim]")
 
         # Step 2: k-NN graph
-        logger.info(f"  [2/4] K-NN GRAPH (k={self.knn_k})")
+        if is_main:
+            _console.print(f"  [bold yellow]►[/bold yellow] [2/4] k-NN Graph (k={self.knn_k})...", end="")
         t0 = time.perf_counter()
         knn_similarities, knn_indices = self._build_knn_graph(embeddings)
         step_times["knn"] = time.perf_counter() - t0
-        logger.info(f"  [2/4] DONE: {num_images:,} queries ({_fmt_time(step_times['knn'])})")
+        step_results["knn"] = f"{num_images:,} queries"
+        if is_main:
+            _console.print(f"\r  [bold green]✓[/bold green] [2/4] k-NN Graph    {step_results['knn']} [dim]({_fmt_time(step_times['knn'])})[/dim]     ")
 
         # Step 3: Mutual edges
-        logger.info(f"  [3/4] MUTUAL EDGES (threshold={sim_threshold:.2f})")
+        if is_main:
+            _console.print(f"  [bold yellow]►[/bold yellow] [3/4] Mutual Edges (threshold={sim_threshold:.2f})...", end="")
         t0 = time.perf_counter()
         mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
         step_times["mutual"] = time.perf_counter() - t0
-        logger.info(f"  [3/4] DONE: {len(mutual_edges):,} edges ({_fmt_time(step_times['mutual'])})")
+        step_results["mutual"] = f"{len(mutual_edges):,} edges"
+        if is_main:
+            _console.print(f"\r  [bold green]✓[/bold green] [3/4] Mutual Edges  {step_results['mutual']} [dim]({_fmt_time(step_times['mutual'])})[/dim]             ")
 
         # Step 4: Clustering
-        logger.info(f"  [4/4] CLUSTERING")
+        if is_main:
+            _console.print("  [bold yellow]►[/bold yellow] [4/4] Clustering...", end="")
         t0 = time.perf_counter()
         cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
         step_times["cluster"] = time.perf_counter() - t0
@@ -467,13 +508,20 @@ class PseudoIDManager:
         avg_cluster_size = num_clustered / len(cluster_to_images) if cluster_to_images else 0.0
         max_size = max((len(v) for v in cluster_to_images.values()), default=0)
 
-        logger.info(f"  [4/4] DONE: {len(cluster_to_images):,} clusters ({_fmt_time(step_times['cluster'])})")
-        logger.info(f"{'='*60}")
-        logger.info(f"  SUMMARY | Total: {_fmt_time(elapsed)}")
-        logger.info(f"    Embed: {_fmt_time(step_times['embed'])} | k-NN: {_fmt_time(step_times['knn'])} | Mutual: {_fmt_time(step_times['mutual'])} | Cluster: {_fmt_time(step_times['cluster'])}")
-        logger.info(f"    Clusters: {len(cluster_to_images):,} | Images: {num_clustered:,}/{num_images:,} ({accept_rate:.1%})")
-        logger.info(f"    Avg size: {avg_cluster_size:.1f} | Max size: {max_size}")
-        logger.info(f"{'='*60}")
+        step_results["cluster"] = f"{len(cluster_to_images):,} clusters"
+        if is_main:
+            _console.print(f"\r  [bold green]✓[/bold green] [4/4] Clustering    {step_results['cluster']} [dim]({_fmt_time(step_times['cluster'])})[/dim]")
+
+            # Summary table
+            table = Table(show_header=False, box=None, padding=(0, 2))
+            table.add_column(style="dim")
+            table.add_column(style="bold")
+            table.add_row("Total time", _fmt_time(elapsed))
+            table.add_row("Clusters", f"{len(cluster_to_images):,}")
+            table.add_row("Clustered", f"{num_clustered:,}/{num_images:,} ({accept_rate:.1%})")
+            table.add_row("Avg/Max size", f"{avg_cluster_size:.1f} / {max_size}")
+            _console.print(Panel(table, title="[bold green]Summary[/bold green]", style="green", padding=(0, 1)))
+            _console.print()
 
         return {
             "pseudo/cluster_count": len(cluster_to_images),
