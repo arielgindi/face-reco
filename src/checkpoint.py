@@ -17,9 +17,8 @@ import wandb
 logger = logging.getLogger(__name__)
 
 
-def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
-    """Find the latest checkpoint from W&B or local folder."""
-    # Try W&B first
+def find_latest_checkpoint(project: str) -> Path:
+    """Find the latest checkpoint from W&B."""
     try:
         api = wandb.Api()
         # Get latest version of checkpoint artifact
@@ -38,14 +37,7 @@ def find_latest_checkpoint(project: str, local_dir: Path | None = None) -> Path:
     except OSError as e:
         logger.debug(f"W&B checkpoint download failed (I/O error): {e}")
 
-    # Fall back to local folder
-    if local_dir and local_dir.exists():
-        ckpts = sorted(local_dir.glob("epoch_*.pt"))
-        if ckpts:
-            logger.info(f"Found local checkpoint: {ckpts[-1].name}")
-            return ckpts[-1]
-
-    raise FileNotFoundError("No checkpoint found in W&B or locally")
+    raise FileNotFoundError("No checkpoint found in W&B")
 
 
 def _filter_warm_start_state(ckpt_state: dict) -> dict:

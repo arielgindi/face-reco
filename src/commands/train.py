@@ -151,9 +151,9 @@ def _setup_training(
     resume = cfg.train.get("resume", "auto")
     if resume:
         if resume == "auto":
-            # Find latest from W&B or local
+            # Find latest from W&B
             wandb_project = cfg.get("wandb", {}).get("project", "")
-            resume_path = find_latest_checkpoint(wandb_project, out_dir / "checkpoints")
+            resume_path = find_latest_checkpoint(wandb_project)
         else:
             resume_path = Path(resume)
         start_epoch = load_checkpoint_for_resume(
