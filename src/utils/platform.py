@@ -18,14 +18,14 @@ def get_optimal_batch_size(*, base_size: int, windows_multiplier: float = 0.25) 
 
 
 def calculate_optimal_embed_batch_size(device, target_vram_usage: float = 0.6) -> int:
-    """Calculate optimal batch size for embedding extraction based on GPU memory.
+    """Calculate optimal batch size for embedding extraction based on FREE GPU memory.
 
     This is specifically for inference-only embedding extraction, not training.
-    Uses actual GPU memory to determine batch size instead of platform heuristics.
+    Uses actual free GPU memory to determine batch size (model may already be loaded).
 
     Args:
         device: torch.device
-        target_vram_usage: Target VRAM utilization (0.0-1.0), default 0.6
+        target_vram_usage: Target utilization of free VRAM (0.0-1.0), default 0.6
 
     Returns:
         Optimal batch size (power of 2)
@@ -36,32 +36,27 @@ def calculate_optimal_embed_batch_size(device, target_vram_usage: float = 0.6) -
         return 2048
 
     try:
-        props = torch.cuda.get_device_properties(device)
-        total_memory_gb = props.total_memory / (1024 ** 3)
-        gpu_name = props.name
+        # Use FREE memory, not total - model is already loaded
+        free_memory = torch.cuda.mem_get_info(device)[0]
+        free_memory_gb = free_memory / (1024 ** 3)
 
-        # GPU-specific optimizations based on memory and architecture
-        if "4070" in gpu_name:
-            # RTX 4070 Ti: 12GB VRAM, conservative batch for iresnet50
-            return 2048
-        elif "4090" in gpu_name or total_memory_gb >= 24:
-            # RTX 4090, A100, H100: 24GB+
-            return 8192
-        elif "4080" in gpu_name or "3090" in gpu_name or total_memory_gb >= 16:
-            # RTX 4080, 3090: 16-24GB
-            return 6144
-        elif total_memory_gb >= 12:
-            # 12-16GB cards
-            return 4096
-        elif total_memory_gb >= 8:
-            # 8-12GB cards
-            return 2048
-        else:
-            # Smaller GPUs
-            return 1024
+        # Each image: 112x112x3 = 37,632 bytes input
+        # Forward pass activations: ~4MB per image for iresnet50
+        # Use conservative estimate: ~5MB per image including gradients
+        bytes_per_image = 5 * 1024 * 1024  # 5 MB
+        usable_memory = free_memory * target_vram_usage
+
+        # Calculate batch size, round down to nearest power of 2
+        max_batch = int(usable_memory / bytes_per_image)
+        batch_size = 1
+        while batch_size * 2 <= max_batch:
+            batch_size *= 2
+
+        # Clamp to reasonable range
+        return max(256, min(batch_size, 4096))
     except Exception:
         # Fallback if GPU detection fails
-        return 2048
+        return 1024
 
 
 def supports_fork() -> bool:
