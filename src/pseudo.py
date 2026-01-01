@@ -7,15 +7,19 @@ import os
 import time
 import warnings
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from threading import Lock
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TaskID, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
 from torch.utils.data import DataLoader, Dataset
 
 if TYPE_CHECKING:
@@ -38,6 +42,38 @@ def _is_main_process() -> bool:
 
 # Rich console - only outputs on main process
 _console = Console(force_terminal=True, highlight=False)
+
+
+def _make_gpu_progress_table(
+    gpu_progress: list[tuple[int, int]],  # [(completed, total), ...]
+    title: str,
+    speed_text: str = "",
+) -> Table:
+    """Create a table showing per-GPU progress bars."""
+    table = Table(show_header=False, box=None, padding=(0, 1), expand=True)
+    table.add_column("GPU", style="cyan", width=6)
+    table.add_column("Bar", ratio=1)
+    table.add_column("%", style="bold", width=5, justify="right")
+
+    for gpu_id, (completed, total) in enumerate(gpu_progress):
+        pct = (completed / total * 100) if total > 0 else 0
+        bar_width = 40
+        filled = int(bar_width * pct / 100)
+        bar = "█" * filled + "░" * (bar_width - filled)
+        table.add_row(f"GPU {gpu_id}", f"[green]{bar}[/green]", f"{pct:3.0f}%")
+
+    # Add totals row
+    total_completed = sum(c for c, _ in gpu_progress)
+    total_total = sum(t for _, t in gpu_progress)
+    total_pct = (total_completed / total_total * 100) if total_total > 0 else 0
+
+    table.add_row("", "", "")  # Spacer
+    total_bar_filled = int(40 * total_pct / 100)
+    total_bar = "█" * total_bar_filled + "░" * (40 - total_bar_filled)
+    speed_suffix = f"  [cyan]{speed_text}[/cyan]" if speed_text else ""
+    table.add_row("[bold]Total", f"[blue]{total_bar}[/blue]{speed_suffix}", f"[bold]{total_pct:3.0f}%")
+
+    return Panel(table, title=f"[bold]{title}[/bold]", border_style="blue")
 
 
 def _fmt_time(seconds: float) -> str:
@@ -250,57 +286,97 @@ class PseudoIDManager:
         num_images = min(total_images, max_images) if max_images is not None else total_images
         is_main = _is_main_process()
 
-        if max_images is not None and num_images < total_images and is_main:
-            logger.info(f"        Subset: {num_images:,}/{total_images:,} ({num_images/total_images:.1%})")
-
+        # Detect available GPUs
+        num_gpus = torch.cuda.device_count()
         embed_dim = model.cfg.embedding_dim
         batch_size = calculate_optimal_embed_batch_size(device)
 
         all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
-        total_batches = (num_images + batch_size - 1) // batch_size
 
-        # Only show progress on main process
-        progress = Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]Embedding"),
-            BarColumn(bar_width=40),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TextColumn("•"),
-            TextColumn("{task.completed:,}/{task.total:,}"),
-            TextColumn("•"),
-            TimeElapsedColumn(),
-            TextColumn("→"),
-            TimeRemainingColumn(),
-            TextColumn("•"),
-            TextColumn("[cyan]{task.fields[ips]:,} img/s"),
-            console=_console,
-            disable=not is_main,
-        )
+        # Split work across GPUs
+        images_per_gpu = (num_images + num_gpus - 1) // num_gpus
+        gpu_ranges = []
+        for gpu_id in range(num_gpus):
+            start = gpu_id * images_per_gpu
+            end = min(start + images_per_gpu, num_images)
+            if start < num_images:
+                gpu_ranges.append((gpu_id, start, end))
 
-        with progress:
-            task = progress.add_task("embed", total=num_images, ips=0)
+        # Track per-GPU progress
+        gpu_progress = [[0, end - start] for _, start, end in gpu_ranges]
+        progress_lock = Lock()
+        start_time = time.perf_counter()
+
+        # Replicate backbone_k to all GPUs
+        backbones = {}
+        for gpu_id, _, _ in gpu_ranges:
+            if gpu_id == 0:
+                backbones[0] = model.backbone_k
+            else:
+                backbones[gpu_id] = type(model.backbone_k)(model.cfg).to(f"cuda:{gpu_id}")
+                backbones[gpu_id].load_state_dict(model.backbone_k.state_dict())
+                backbones[gpu_id].eval()
+
+        def process_gpu(gpu_id: int, start: int, end: int) -> None:
+            gpu_device = torch.device(f"cuda:{gpu_id}")
+            backbone = backbones[gpu_id]
+            gpu_num_images = end - start
+            gpu_batches = (gpu_num_images + batch_size - 1) // batch_size
 
             with torch.no_grad(), torch.amp.autocast("cuda"):
-                for batch_idx in range(total_batches):
-                    start_idx = batch_idx * batch_size
-                    end_idx = min(start_idx + batch_size, num_images)
+                for batch_idx in range(gpu_batches):
+                    b_start = start + batch_idx * batch_size
+                    b_end = min(b_start + batch_size, end)
 
-                    # Zero-copy mmap access
-                    batch_slice = images[start_idx:end_idx]
+                    batch_slice = images[b_start:b_end]
                     if not batch_slice.flags["C_CONTIGUOUS"]:
                         batch_slice = np.ascontiguousarray(batch_slice)
 
-                    batch_gpu = torch.from_numpy(batch_slice).to(device, non_blocking=True)
-                    # Fused preprocessing
+                    batch_gpu = torch.from_numpy(batch_slice).to(gpu_device, non_blocking=True)
                     batch_gpu = batch_gpu.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
-                    embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
-                    all_embeddings[start_idx:end_idx] = embeddings.cpu()
-                    del batch_gpu, embeddings
+                    emb = l2_normalize(backbone(batch_gpu), dim=1)
+                    all_embeddings[b_start:b_end] = emb.cpu()
+                    del batch_gpu, emb
 
-                    # Update progress with images/sec
-                    elapsed = time.perf_counter() - self._embed_start_time if self._embed_start_time else 1
-                    ips = int(end_idx / elapsed) if elapsed > 0 else 0
-                    progress.update(task, completed=end_idx, ips=ips)
+                    with progress_lock:
+                        gpu_progress[gpu_id][0] = b_end - start
+
+        # Run with live progress display
+        if is_main and num_gpus > 1:
+            with Live(_make_gpu_progress_table([(0, t) for _, t in gpu_progress], "[1/4] EMBEDDING"),
+                      console=_console, refresh_per_second=4) as live:
+                with ThreadPoolExecutor(max_workers=num_gpus) as executor:
+                    futures = [executor.submit(process_gpu, gpu_id, start, end)
+                               for gpu_id, start, end in gpu_ranges]
+                    while not all(f.done() for f in futures):
+                        elapsed = time.perf_counter() - start_time
+                        total_done = sum(p[0] for p in gpu_progress)
+                        ips = int(total_done / elapsed) if elapsed > 0 else 0
+                        live.update(_make_gpu_progress_table(
+                            [(p[0], p[1]) for p in gpu_progress],
+                            "[1/4] EMBEDDING",
+                            f"{ips:,} img/s"
+                        ))
+                        time.sleep(0.1)
+                    # Final update
+                    elapsed = time.perf_counter() - start_time
+                    total_done = sum(p[0] for p in gpu_progress)
+                    ips = int(total_done / elapsed) if elapsed > 0 else 0
+                    live.update(_make_gpu_progress_table(
+                        [(p[0], p[1]) for p in gpu_progress],
+                        "[1/4] EMBEDDING ✓",
+                        f"{ips:,} img/s"
+                    ))
+        else:
+            # Single GPU or non-main process - run without fancy display
+            for gpu_id, start, end in gpu_ranges:
+                process_gpu(gpu_id, start, end)
+
+        # Cleanup replicated backbones
+        for gpu_id in backbones:
+            if gpu_id != 0:
+                del backbones[gpu_id]
+        torch.cuda.empty_cache()
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
@@ -308,10 +384,6 @@ class PseudoIDManager:
         num_images, embed_dim = embeddings.shape
         search_k = self.knn_k + 1
         is_main = _is_main_process()
-
-        def _log(msg: str) -> None:
-            if is_main:
-                _console.print(f"        [dim]{msg}[/dim]")
 
         try:
             import faiss
@@ -330,51 +402,116 @@ class PseudoIDManager:
                     with torch.cuda.device(i):
                         torch.cuda.empty_cache()
 
-                _log(f"FAISS: {num_gpus} GPU(s) sharded")
                 t0 = time.perf_counter()
+                shard_size = (num_images + num_gpus - 1) // num_gpus
 
-                if num_gpus > 1:
-                    # Shard index across GPUs - each GPU holds 1/N of vectors
-                    # This uses ~1/N memory per GPU vs replicating full index
-                    index = faiss.IndexShards(embed_dim, True, False)  # (dim, threaded, successive_ids)
-                    shard_size = (num_images + num_gpus - 1) // num_gpus
+                if num_gpus > 1 and is_main:
+                    # Build shards with per-GPU progress
+                    gpu_progress = [[0, 2] for _ in range(num_gpus)]  # 2 steps: add + ready
 
+                    with Live(_make_gpu_progress_table([(0, 2) for _ in range(num_gpus)], "[2/4] K-NN GRAPH - Building Index"),
+                              console=_console, refresh_per_second=4) as live:
+                        index = faiss.IndexShards(embed_dim, True, False)
+
+                        for i in range(num_gpus):
+                            gpu_res = faiss.StandardGpuResources()
+                            gpu_res.setTempMemory(self.faiss_temp_memory_gb << 30)
+                            sub_index = faiss.IndexFlatIP(embed_dim)
+                            gpu_index = faiss.index_cpu_to_gpu(gpu_res, i, sub_index)
+
+                            start = i * shard_size
+                            end = min(start + shard_size, num_images)
+                            if start < num_images:
+                                gpu_index.add(embeddings[start:end])
+                            gpu_progress[i][0] = 1  # Adding done
+
+                            live.update(_make_gpu_progress_table(
+                                [(p[0], p[1]) for p in gpu_progress],
+                                "[2/4] K-NN GRAPH - Building Index",
+                                f"{(i+1)*shard_size:,} vectors"
+                            ))
+
+                            index.add_shard(gpu_index)
+                            gpu_progress[i][0] = 2  # Shard ready
+
+                        live.update(_make_gpu_progress_table(
+                            [(2, 2) for _ in range(num_gpus)],
+                            "[2/4] K-NN GRAPH - Index Built ✓",
+                            f"{num_images:,} vectors"
+                        ))
+
+                    add_time = time.perf_counter() - t0
+
+                    # Search phase with progress
+                    t0 = time.perf_counter()
+                    search_batch = 50000  # Search in batches to show progress
+                    all_similarities = np.empty((num_images, search_k), dtype=np.float32)
+                    all_indices = np.empty((num_images, search_k), dtype=np.int64)
+
+                    with Live(_make_gpu_progress_table([(0, shard_size) for _ in range(num_gpus)], "[2/4] K-NN GRAPH - Searching"),
+                              console=_console, refresh_per_second=4) as live:
+                        for batch_start in range(0, num_images, search_batch):
+                            batch_end = min(batch_start + search_batch, num_images)
+                            sim, idx = index.search(embeddings[batch_start:batch_end], search_k)
+                            all_similarities[batch_start:batch_end] = sim
+                            all_indices[batch_start:batch_end] = idx
+
+                            # Update per-GPU progress (approximate based on batch position)
+                            for gpu_id in range(num_gpus):
+                                gpu_start = gpu_id * shard_size
+                                gpu_done = min(max(0, batch_end - gpu_start), shard_size)
+                                gpu_progress[gpu_id][0] = gpu_done
+
+                            elapsed = time.perf_counter() - t0
+                            qps = int(batch_end / elapsed) if elapsed > 0 else 0
+                            live.update(_make_gpu_progress_table(
+                                [(p[0], shard_size) for p in gpu_progress],
+                                "[2/4] K-NN GRAPH - Searching",
+                                f"{qps:,} q/s"
+                            ))
+
+                        live.update(_make_gpu_progress_table(
+                            [(shard_size, shard_size) for _ in range(num_gpus)],
+                            "[2/4] K-NN GRAPH ✓",
+                            f"{int(num_images / (time.perf_counter() - t0)):,} q/s"
+                        ))
+
+                    similarities, indices = all_similarities, all_indices
+
+                elif num_gpus > 1:
+                    # Multi-GPU but not main process
+                    index = faiss.IndexShards(embed_dim, True, False)
                     for i in range(num_gpus):
                         gpu_res = faiss.StandardGpuResources()
                         gpu_res.setTempMemory(self.faiss_temp_memory_gb << 30)
                         sub_index = faiss.IndexFlatIP(embed_dim)
                         gpu_index = faiss.index_cpu_to_gpu(gpu_res, i, sub_index)
-
-                        # Add shard of vectors to this GPU
                         start = i * shard_size
                         end = min(start + shard_size, num_images)
                         if start < num_images:
                             gpu_index.add(embeddings[start:end])
                         index.add_shard(gpu_index)
+                    similarities, indices = index.search(embeddings, search_k)
                 else:
+                    # Single GPU
                     gpu_resources = faiss.StandardGpuResources()
                     gpu_resources.setTempMemory(self.faiss_temp_memory_gb << 30)
                     index = faiss.index_cpu_to_gpu(gpu_resources, 0, faiss.IndexFlatIP(embed_dim))
                     index.add(embeddings)
-
-                add_time = time.perf_counter() - t0
-                _log(f"Added {num_images:,} vectors in {add_time:.1f}s")
-
-                t0 = time.perf_counter()
-                similarities, indices = index.search(embeddings, search_k)
-                search_time = time.perf_counter() - t0
-                _log(f"Searched k={self.knn_k} in {search_time:.1f}s ({num_images/search_time:,.0f} q/s)")
+                    similarities, indices = index.search(embeddings, search_k)
             else:
                 nlist = min(4096, num_images // 100)
                 quantizer = faiss.IndexFlatIP(embed_dim)
                 index = faiss.IndexIVFFlat(quantizer, embed_dim, nlist, faiss.METRIC_INNER_PRODUCT)
                 index.nprobe = self.faiss_nprobe
-                _log(f"FAISS-CPU: IVF nlist={nlist}")
+                if is_main:
+                    _console.print(f"        [dim]FAISS-CPU: IVF nlist={nlist}[/dim]")
                 index.train(embeddings)
                 index.add(embeddings)
                 similarities, indices = index.search(embeddings, search_k)
         except ImportError:
-            _log("Backend: sklearn (slow)")
+            if is_main:
+                _console.print("        [dim]Backend: sklearn (slow)[/dim]")
             from sklearn.neighbors import NearestNeighbors
             nn_model = NearestNeighbors(n_neighbors=search_k, metric="cosine").fit(embeddings)
             distances, indices = nn_model.kneighbors(embeddings)
@@ -454,7 +591,6 @@ class PseudoIDManager:
         """Run pseudo-ID mining: embed -> kNN -> mutual filter -> cluster."""
         start_time = time.perf_counter()
         step_times: dict[str, float] = {}
-        step_results: dict[str, str] = {}
         is_main = _is_main_process()
 
         # Header
@@ -466,9 +602,7 @@ class PseudoIDManager:
                 padding=(0, 2),
             ))
 
-        # Step 1: Embedding
-        if is_main:
-            _console.print("  [bold yellow]►[/bold yellow] [1/4] Embedding...", end="")
+        # Step 1: Embedding (has its own per-GPU progress display)
         t0 = time.perf_counter()
         self._embed_start_time = t0
         embeddings, image_bytes_list = self._extract_embeddings(
@@ -477,36 +611,50 @@ class PseudoIDManager:
         num_images = len(embeddings)
         step_times["embed"] = time.perf_counter() - t0
         embed_ips = num_images / step_times["embed"] if step_times["embed"] > 0 else 0
-        step_results["embed"] = f"{num_images:,} images @ {embed_ips:,.0f} img/s"
         if is_main:
-            _console.print(f"\r  [bold green]✓[/bold green] [1/4] Embedding     {step_results['embed']} [dim]({_fmt_time(step_times['embed'])})[/dim]")
+            _console.print(f"  [bold green]✓[/bold green] [1/4] Embedding     {num_images:,} images @ {embed_ips:,.0f} img/s [dim]({_fmt_time(step_times['embed'])})[/dim]")
 
-        # Step 2: k-NN graph
-        if is_main:
-            _console.print(f"  [bold yellow]►[/bold yellow] [2/4] k-NN Graph (k={self.knn_k})...", end="")
+        # Step 2: k-NN graph (has its own per-GPU progress display)
         t0 = time.perf_counter()
         knn_similarities, knn_indices = self._build_knn_graph(embeddings)
         step_times["knn"] = time.perf_counter() - t0
-        step_results["knn"] = f"{num_images:,} queries"
+        knn_qps = num_images / step_times["knn"] if step_times["knn"] > 0 else 0
         if is_main:
-            _console.print(f"\r  [bold green]✓[/bold green] [2/4] k-NN Graph    {step_results['knn']} [dim]({_fmt_time(step_times['knn'])})[/dim]     ")
+            _console.print(f"  [bold green]✓[/bold green] [2/4] k-NN Graph    {num_images:,} queries @ {knn_qps:,.0f} q/s [dim]({_fmt_time(step_times['knn'])})[/dim]")
 
-        # Step 3: Mutual edges
+        # Step 3: Mutual edges (CPU operation - simple progress)
         if is_main:
-            _console.print(f"  [bold yellow]►[/bold yellow] [3/4] Mutual Edges (threshold={sim_threshold:.2f})...", end="")
-        t0 = time.perf_counter()
-        mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
-        step_times["mutual"] = time.perf_counter() - t0
-        step_results["mutual"] = f"{len(mutual_edges):,} edges"
-        if is_main:
-            _console.print(f"\r  [bold green]✓[/bold green] [3/4] Mutual Edges  {step_results['mutual']} [dim]({_fmt_time(step_times['mutual'])})[/dim]             ")
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold yellow][3/4] Mutual Edges[/bold yellow]"),
+                TextColumn(f"threshold={sim_threshold:.2f}"),
+                console=_console,
+            ) as progress:
+                progress.add_task("mutual", total=None)
+                t0 = time.perf_counter()
+                mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
+                step_times["mutual"] = time.perf_counter() - t0
+            _console.print(f"  [bold green]✓[/bold green] [3/4] Mutual Edges  {len(mutual_edges):,} edges [dim]({_fmt_time(step_times['mutual'])})[/dim]")
+        else:
+            t0 = time.perf_counter()
+            mutual_edges = self._filter_mutual_edges(knn_indices, knn_similarities, sim_threshold)
+            step_times["mutual"] = time.perf_counter() - t0
 
-        # Step 4: Clustering
+        # Step 4: Clustering (CPU operation - simple progress)
         if is_main:
-            _console.print("  [bold yellow]►[/bold yellow] [4/4] Clustering...", end="")
-        t0 = time.perf_counter()
-        cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
-        step_times["cluster"] = time.perf_counter() - t0
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[bold yellow][4/4] Clustering[/bold yellow]"),
+                console=_console,
+            ) as progress:
+                progress.add_task("cluster", total=None)
+                t0 = time.perf_counter()
+                cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
+                step_times["cluster"] = time.perf_counter() - t0
+        else:
+            t0 = time.perf_counter()
+            cluster_labels, cluster_to_images = self._cluster_components(mutual_edges, num_images)
+            step_times["cluster"] = time.perf_counter() - t0
 
         num_clustered = int((cluster_labels >= 0).sum())
         self.state = PseudoIDState(
@@ -530,9 +678,8 @@ class PseudoIDManager:
         avg_cluster_size = num_clustered / len(cluster_to_images) if cluster_to_images else 0.0
         max_size = max((len(v) for v in cluster_to_images.values()), default=0)
 
-        step_results["cluster"] = f"{len(cluster_to_images):,} clusters"
         if is_main:
-            _console.print(f"\r  [bold green]✓[/bold green] [4/4] Clustering    {step_results['cluster']} [dim]({_fmt_time(step_times['cluster'])})[/dim]")
+            _console.print(f"  [bold green]✓[/bold green] [4/4] Clustering    {len(cluster_to_images):,} clusters [dim]({_fmt_time(step_times['cluster'])})[/dim]")
 
             # Summary table
             table = Table(show_header=False, box=None, padding=(0, 2))
