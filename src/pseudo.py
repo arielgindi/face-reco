@@ -394,12 +394,14 @@ class PseudoIDManager:
             # local_embeddings is already shard_size, but only local_count are valid
             # Zero-pad the rest (already zeros from empty init)
 
-            # all_gather requires same-sized tensors
-            gathered = [torch.empty((shard_size, embed_dim), dtype=torch.float32) for _ in range(world_size)]
-            torch.distributed.all_gather(gathered, local_embeddings)
+            # all_gather requires CUDA tensors with NCCL backend
+            local_cuda = local_embeddings.to(device)
+            gathered = [torch.empty((shard_size, embed_dim), dtype=torch.float32, device=device) for _ in range(world_size)]
+            torch.distributed.all_gather(gathered, local_cuda)
 
-            # Concatenate and trim to actual num_images
-            all_embeddings = torch.cat(gathered, dim=0)[:num_images]
+            # Concatenate and trim to actual num_images, move back to CPU
+            all_embeddings = torch.cat(gathered, dim=0)[:num_images].cpu()
+            del local_cuda, gathered
         else:
             all_embeddings = local_embeddings[:local_count]
 
