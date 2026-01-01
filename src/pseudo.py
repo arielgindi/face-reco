@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import os
 import time
@@ -313,8 +314,8 @@ class PseudoIDManager:
             if gpu_id == 0:
                 backbones[0] = model.backbone_k
             else:
-                backbones[gpu_id] = type(model.backbone_k)(model.cfg).to(f"cuda:{gpu_id}")
-                backbones[gpu_id].load_state_dict(model.backbone_k.state_dict())
+                # Deep copy and move to target GPU
+                backbones[gpu_id] = copy.deepcopy(model.backbone_k).to(f"cuda:{gpu_id}")
                 backbones[gpu_id].eval()
 
         def process_gpu(gpu_id: int, start: int, end: int) -> None:
