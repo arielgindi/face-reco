@@ -320,7 +320,7 @@ class PseudoIDManager:
 
                     gpu_progress[0][0] = b_end - start
 
-        # Run embedding with progress display (single GPU per rank)
+        # Only rank 0 does embedding, then broadcasts to other ranks
         gpu_progress = [[0, num_images]]
         if is_main:
             with Live(_make_gpu_progress_table([(0, num_images)], "[1/4] EMBEDDING"),
@@ -347,9 +347,14 @@ class PseudoIDManager:
                     "[1/4] EMBEDDING ✓",
                     f"{ips:,} img/s"
                 ))
-        else:
-            # Non-main process - run without display
-            process_embedding(0, num_images)
+        # else: non-main ranks wait for broadcast below
+
+        # Broadcast embeddings from rank 0 to all other ranks
+        if torch.distributed.is_initialized():
+            embed_tensor = torch.from_numpy(all_embeddings.numpy() if hasattr(all_embeddings, 'numpy') else all_embeddings).to(device)
+            torch.distributed.broadcast(embed_tensor, src=0)
+            all_embeddings = embed_tensor.cpu()
+            del embed_tensor
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
