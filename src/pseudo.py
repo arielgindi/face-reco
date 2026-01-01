@@ -21,6 +21,39 @@ from src.utils.platform import get_optimal_batch_size
 logger = logging.getLogger(__name__)
 
 
+class _MmapEmbedDataset(Dataset):
+    """Dataset wrapper for mmap array (module-level for Windows pickling)."""
+
+    def __init__(self, arr: np.ndarray, length: int):
+        self._arr_ref = arr  # Keep reference to original
+        self._arr = None  # Will be loaded in worker
+        self.length = length
+
+    def __len__(self) -> int:
+        return self.length
+
+    @property
+    def arr(self) -> np.ndarray:
+        if self._arr is None:
+            self._arr = self._arr_ref
+        return self._arr
+
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
+        img = self.arr[idx]
+        if not img.flags["C_CONTIGUOUS"]:
+            img = np.ascontiguousarray(img)
+        return torch.from_numpy(img), idx
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state["_arr_ref"] = None  # Don't pickle the array
+        state["_arr"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+
+
 @dataclass
 class PseudoIDState:
     """Pseudo-ID cluster assignments for all training images."""
@@ -130,14 +163,26 @@ class PseudoIDManager:
             return self._binary_images[idx] if 0 <= idx < len(self._binary_images) else None
         return self._image_bytes_cache.get(idx)
 
+    def __getstate__(self) -> dict:
+        """Custom pickle: exclude mmap array (worker processes will reload it lazily)."""
+        state = self.__dict__.copy()
+        # Don't pickle the large mmap array - workers will get it from the dataset
+        state["_binary_images"] = None
+        state["_image_bytes_cache"] = {}  # Also clear this to save memory
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Custom unpickle: restore state without mmap (accessed via dataset instead)."""
+        self.__dict__.update(state)
+
     def _extract_embeddings(
-        self, model: MoCo, datasets: list, device: torch.device, batch_size: int, num_workers: int
+        self, model: MoCo, datasets: list, device: torch.device, batch_size: int, num_workers: int, max_images: int | None = None
     ) -> tuple[np.ndarray, list[bytes]]:
         from src.model import l2_normalize
 
         model.eval()
         if hasattr(datasets[0], "images"):
-            result = self._extract_binary_fast(model, datasets[0].images, device)
+            result = self._extract_binary_fast(model, datasets[0].images, device, max_images)
             model.train()
             return result
 
@@ -167,12 +212,21 @@ class PseudoIDManager:
         return torch.cat(all_embeddings).numpy().astype(np.float32), all_image_bytes
 
     def _extract_binary_fast(
-        self, model: MoCo, images: np.ndarray, device: torch.device
+        self, model: MoCo, images: np.ndarray, device: torch.device, max_images: int | None = None
     ) -> tuple[np.ndarray, list[bytes]]:
         from src.model import l2_normalize
+        from src.utils.platform import calculate_optimal_embed_batch_size
 
-        num_images, embed_dim = len(images), model.cfg.embedding_dim
-        batch_size = get_optimal_batch_size(base_size=self.batch_size_base)
+        total_images = len(images)
+        num_images = min(total_images, max_images) if max_images is not None else total_images
+
+        if max_images is not None and num_images < total_images:
+            logger.info(f"        Using subset: {num_images:,}/{total_images:,} images ({num_images/total_images:.1%})")
+
+        embed_dim = model.cfg.embedding_dim
+        batch_size = calculate_optimal_embed_batch_size(device)
+        logger.info(f"        Batch size: {batch_size}")
+
         all_embeddings = torch.empty((num_images, embed_dim), dtype=torch.float32)
         total_batches = (num_images + batch_size - 1) // batch_size
         log_interval = max(1, total_batches // 10)
@@ -181,25 +235,24 @@ class PseudoIDManager:
             for batch_idx in range(total_batches):
                 start_idx = batch_idx * batch_size
                 end_idx = min(start_idx + batch_size, num_images)
-                batch_np = np.array(images[start_idx:end_idx], copy=True, order="C")
-                batch_gpu = torch.from_numpy(batch_np).to(device)
-                del batch_np
-                batch_gpu = batch_gpu.permute(0, 3, 1, 2).float().div_(255.0).sub_(0.5).div_(0.5)
+
+                # Zero-copy mmap access
+                batch_slice = images[start_idx:end_idx]
+                if not batch_slice.flags["C_CONTIGUOUS"]:
+                    batch_slice = np.ascontiguousarray(batch_slice)
+
+                batch_gpu = torch.from_numpy(batch_slice).to(device, non_blocking=True)
+                # Fused preprocessing
+                batch_gpu = batch_gpu.permute(0, 3, 1, 2).to(torch.float32).mul_(2.0/255.0).sub_(1.0)
                 embeddings = l2_normalize(model.backbone_k(batch_gpu), dim=1)
-                all_embeddings[start_idx:end_idx] = embeddings.float().cpu()
+                all_embeddings[start_idx:end_idx] = embeddings.cpu()
                 del batch_gpu, embeddings
 
                 if (batch_idx + 1) % log_interval == 0 or batch_idx == total_batches - 1:
                     pct = (batch_idx + 1) / total_batches * 100 if total_batches > 0 else 0
-                    elapsed = (
-                        time.perf_counter() - self._embed_start_time
-                        if self._embed_start_time
-                        else 1
-                    )
+                    elapsed = (time.perf_counter() - self._embed_start_time if self._embed_start_time else 1)
                     ips = (end_idx / elapsed) if elapsed > 0 else 0
-                    logger.info(
-                        f"        Embedding: {pct:.0f}% ({end_idx:,}/{num_images:,}) @ {ips:,.0f} img/s"
-                    )
+                    logger.info(f"        Embedding: {pct:.0f}% ({end_idx:,}/{num_images:,}) @ {ips:,.0f} img/s")
 
         return all_embeddings.numpy(), [i.to_bytes(4, "little") for i in range(num_images)]
 
@@ -311,6 +364,7 @@ class PseudoIDManager:
         device: torch.device,
         batch_size: int = 256,
         num_workers: int = 2,
+        max_images: int | None = None,
     ) -> dict[str, Any]:
         """Run pseudo-ID mining: embed -> kNN -> mutual filter -> cluster."""
         start_time = time.perf_counter()
@@ -320,7 +374,7 @@ class PseudoIDManager:
         t0 = time.perf_counter()
         self._embed_start_time = t0
         embeddings, image_bytes_list = self._extract_embeddings(
-            model, datasets, device, batch_size, num_workers
+            model, datasets, device, batch_size, num_workers, max_images
         )
         num_images = len(embeddings)
         embed_time = time.perf_counter() - t0

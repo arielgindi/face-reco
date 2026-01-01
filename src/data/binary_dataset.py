@@ -52,22 +52,46 @@ class BinaryImageDataset(IterableDataset[tuple[torch.Tensor, torch.Tensor]]):
                 f"Binary cache not found: {self.npy_path}\nRun: python fast_convert.py"
             )
 
-        # Use mmap on ALL platforms - instant load, zero copy
-        logger.info(f"Loading binary cache (mmap): {self.npy_path}")
-        self.images: np.ndarray = np.load(str(self.npy_path), mmap_mode="r")
+        # Lazy load: only store metadata, load mmap in worker processes
+        # This avoids pickling the large mmap array on Windows (spawn)
+        self._images: np.ndarray | None = None
+        self._num_images: int | None = None
+        self._shape: tuple[int, ...] | None = None
 
-        if self.images.ndim != 4 or self.images.shape[3] != 3:
-            raise ValueError(f"Expected (N, H, W, 3), got {self.images.shape}")
+        # Pre-compute metadata (fast, just reads npy header)
+        self._init_metadata()
 
-        # Log size (virtual memory, not actual RAM usage)
-        self._num_images = len(self.images)
-        size_gb = (self._num_images * self.images.shape[1] * self.images.shape[2] * 3) / 1e9
+    def _init_metadata(self) -> None:
+        """Load just the shape info without keeping mmap reference."""
+        arr = np.load(str(self.npy_path), mmap_mode="r")
+        if arr.ndim != 4 or arr.shape[3] != 3:
+            raise ValueError(f"Expected (N, H, W, 3), got {arr.shape}")
+        self._num_images = len(arr)
+        self._shape = arr.shape
+        size_gb = (self._num_images * arr.shape[1] * arr.shape[2] * 3) / 1e9
         logger.info(f"Loaded {self._num_images:,} images, {size_gb:.1f} GB (Virtual)")
+        # Don't store arr - let it be garbage collected
 
-        # Skip contiguous check - mmap arrays are read-only views, can't modify
+    @property
+    def images(self) -> np.ndarray:
+        """Lazy-load mmap array (called in worker process on Windows)."""
+        if self._images is None:
+            self._images = np.load(str(self.npy_path), mmap_mode="r")
+        return self._images
 
     def __len__(self) -> int:
         return self._num_images
+
+    def __getstate__(self) -> dict:
+        """Custom pickle: exclude mmap array (worker processes will reload it lazily)."""
+        state = self.__dict__.copy()
+        # Don't pickle the large mmap array - workers will reload it via the images property
+        state["_images"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        """Custom unpickle: restore state without mmap (will be loaded lazily on first access)."""
+        self.__dict__.update(state)
 
     def __iter__(self) -> Iterator[tuple[torch.Tensor, torch.Tensor]]:
         """Yield (view_q, view_k) pairs with block shuffle for sequential IO."""
