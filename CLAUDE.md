@@ -24,17 +24,19 @@ export UV_PROJECT_ENVIRONMENT=/root/venv
 ## Training Commands
 
 ```bash
-# Full training (3 GPUs)
-uv run torchrun --standalone --nproc_per_node=3 main.py \
+# Full training (3 GPUs) - Optimized settings
+uv run torchrun --nproc_per_node=3 -m src.commands.train \
+  data.binary_cache_path=/dev/shm/images.npy \
   train.batch.size=384 \
+  train.batch.grad_accum_steps=1 \
   train.optimizer.lr=0.03 \
-  data.binary_cache_path=/dev/shm/images.npy
+  train.lr_schedule.warmup.start_lr=0.003
 
 # Test with 1% data
-uv run torchrun --standalone --nproc_per_node=3 main.py \
+uv run torchrun --nproc_per_node=3 -m src.commands.train \
+  data.binary_cache_path=/dev/shm/images.npy \
   train.batch.size=384 \
   train.optimizer.lr=0.03 \
-  data.binary_cache_path=/dev/shm/images.npy \
   data.data_fraction=0.01
 
 # Resume from specific checkpoint
@@ -61,8 +63,10 @@ Ctrl+B, D                  # Detach
 |--------|-------|
 | Embedding speed | 9,000 img/s (3 GPUs parallel) |
 | k-NN search | 13,000 q/s |
-| Training IPS | ~1,400-1,500 total (478/GPU) |
-| Batch size | 384/GPU x 3 = 1,152 effective |
+| Training IPS | ~1,400 total (473/GPU) |
+| Batch size | 384/GPU × 3 = 1,152 effective |
+| Steps per epoch | ~1,059 (per GPU) |
+| Epoch time | ~5 min (training) + 4 min (pseudo-ID) |
 
 ## Key Config Paths
 
